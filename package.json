@@ -1,0 +1,10 @@
+{
+  "name": "clipbrain", "private": true, "version": "0.1.0", "type": "module",
+  "scripts": { "cb": "tsx src/cli.ts", "test": "vitest run", "studio": "remotion studio remotion/index.ts" },
+  "dependencies": {
+    "remotion": "4.0.527", "@remotion/bundler": "4.0.527", "@remotion/renderer": "4.0.527", "@remotion/cli": "4.0.527",
+    "@remotion/install-whisper-cpp": "4.0.527", "@remotion/google-fonts": "4.0.527",
+    "react": "18.3.1", "react-dom": "18.3.1", "onnxruntime-node": "^1.20.0", "google-auth-library": "^9.15.0"
+  },
+  "devDependencies": { "typescript": "^5.6.0", "tsx": "^4.19.0", "vitest": "^2.1.0", "@types/node": "^22.0.0", "@types/react": "^18.3.0" }
+}
