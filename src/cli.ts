@@ -2,6 +2,7 @@ import { doctor as runDoctor, setup as runSetup } from './tools/bins.js';
 import { log } from './log.js';
 import { llmJson, setBackend, ledgerSummary } from './llm/llm.js';
 import { claudeBackend } from './llm/claude.js';
+import { listChannel, fetchSubs } from './yt/ytdlp.js';
 
 export type ParsedArgs = { _: string[]; flags: Record<string, string | boolean> };
 
@@ -84,6 +85,37 @@ export const commands: Record<string, { help: string; run: (a: ParsedArgs) => Pr
       console.log('purpose'.padEnd(24), 'calls'.padEnd(8), 'costUsd');
       for (const [purpose, v] of Object.entries(s.byPurpose)) {
         console.log(purpose.padEnd(24), String(v.calls).padEnd(8), v.costUsd.toFixed(4));
+      }
+    },
+  },
+  'yt-smoke': {
+    help: 'List a channel\'s shorts and fetch subtitles for the first one (live smoke test).',
+    async run(a) {
+      const channelUrl = a._[0];
+      if (!channelUrl) {
+        log('usage: cb yt-smoke <channelUrl>');
+        process.exitCode = 1;
+        return;
+      }
+      try {
+        const shorts = await listChannel(channelUrl, 'shorts', 5);
+        if (shorts.length === 0) {
+          log('no shorts found');
+          return;
+        }
+        for (const s of shorts.slice(0, 3)) {
+          console.log(`${s.id}  views=${s.views}  uploadDate=${s.uploadDate}  duration=${s.durationSec}s  ${s.title}`);
+        }
+        const words = await fetchSubs(shorts[0].id);
+        log(`subs word count for ${shorts[0].id}: ${words ? words.length : 'none'}`);
+      } catch (err) {
+        const msg = err instanceof Error ? err.message : String(err);
+        if (/429|sign in to confirm|not a bot/i.test(msg)) {
+          log('BLOCKED:', msg);
+          process.exitCode = 1;
+          return;
+        }
+        throw err;
       }
     },
   },
