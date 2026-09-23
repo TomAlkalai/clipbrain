@@ -13,22 +13,40 @@ const BRACKETED_RE = /^\[[^\]]*\]$/; // e.g. [Music], [BLANK_AUDIO] — non-spee
 // whose text does NOT start with a space is a sub-word continuation of the previous token
 // (e.g. "Hor" + "mozi" -> "Hormozi") and gets merged in, extending the previous word's end
 // time. Bracketed non-speech markers and empty/whitespace-only tokens are dropped.
+//
+// A no-leading-space token may only continue the word produced by the IMMEDIATELY PRECEDING
+// raw caption — not just "whatever the last word in the output happens to be". Otherwise, once
+// a bracket marker in between gets dropped (whether it was a single token or, per
+// wordsFromCaptions' own merge-then-pop for multi-token markers, several), a later no-space
+// token would wrongly glue itself onto the word before the marker (e.g. "says" + <dropped
+// "[MUSIC]"> + "oops" must NOT become "saysoops"). `prevKept` tracks whether the previous raw
+// caption actually contributed to (and left in place) the current last word.
 export function wordsFromCaptions(caps: { text: string; startMs: number; endMs: number }[]): Word[] {
   const words: Word[] = [];
+  let prevKept = false;
   for (const cap of caps) {
-    const isContinuation = cap.text.length > 0 && !cap.text.startsWith(' ') && words.length > 0;
+    const isContinuation = cap.text.length > 0 && !cap.text.startsWith(' ') && prevKept;
     if (isContinuation) {
       const last = words[words.length - 1];
       last.w += cap.text;
       last.end = cap.endMs / 1000;
       // whisper.cpp sometimes splits a bracketed marker across tokens (e.g. " [MUSIC" + "]"),
       // so the marker only becomes a complete "[...]" after this merge — re-check here too.
-      if (BRACKETED_RE.test(last.w.trim())) words.pop();
+      if (BRACKETED_RE.test(last.w.trim())) {
+        words.pop();
+        prevKept = false;
+      } else {
+        prevKept = true;
+      }
       continue;
     }
     const trimmed = cap.text.trim();
-    if (trimmed === '' || BRACKETED_RE.test(trimmed)) continue;
+    if (trimmed === '' || BRACKETED_RE.test(trimmed)) {
+      prevKept = false;
+      continue;
+    }
     words.push({ w: trimmed, start: cap.startMs / 1000, end: cap.endMs / 1000 });
+    prevKept = true;
   }
   return words;
 }

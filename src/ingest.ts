@@ -35,12 +35,11 @@ async function probeLocalFile(filePath: string): Promise<{ width: number; height
 }
 
 export async function ingest(input: string, creator: string): Promise<Source> {
-  let c;
-  try {
-    c = loadCreator(creator);
-  } catch {
+  const creatorFilePath = path.join(paths.creator(creator), 'creator.json');
+  if (!fs.existsSync(creatorFilePath)) {
     throw new Error(`unknown creator '${creator}' — record it first with \`cb creator add\``);
   }
+  const c = loadCreator(creator);
   if (!c.clippingPermission) {
     throw new Error("record the creator's clipping permission with `cb creator add`");
   }
@@ -58,32 +57,37 @@ export async function ingest(input: string, creator: string): Promise<Source> {
     const id = newId('src');
     const dir = paths.source(id);
     fs.mkdirSync(dir, { recursive: true });
-    const audioPath = path.join(dir, 'audio.wav');
-    const proxyPath = path.join(dir, 'proxy.mp4');
+    try {
+      const audioPath = path.join(dir, 'audio.wav');
+      const proxyPath = path.join(dir, 'proxy.mp4');
 
-    const doneAudio = step(`downloading audio (${info.id})`);
-    await downloadAudio(input, audioPath);
-    doneAudio();
+      const doneAudio = step(`downloading audio (${info.id})`);
+      await downloadAudio(input, audioPath);
+      doneAudio();
 
-    const doneProxy = step(`downloading proxy (${info.id})`);
-    await downloadProxy(input, proxyPath);
-    doneProxy();
+      const doneProxy = step(`downloading proxy (${info.id})`);
+      await downloadProxy(input, proxyPath);
+      doneProxy();
 
-    const source: Source = {
-      id,
-      creator,
-      kind: 'youtube',
-      url: input,
-      videoId: info.id,
-      title: info.title,
-      durationSec: info.durationSec,
-      width: info.width,
-      height: info.height,
-      createdAt: new Date().toISOString(),
-    };
-    saveSource(source);
-    log(`ingested ${id}: ${source.title} (${source.durationSec}s)`);
-    return source;
+      const source: Source = {
+        id,
+        creator,
+        kind: 'youtube',
+        url: input,
+        videoId: info.id,
+        title: info.title,
+        durationSec: info.durationSec,
+        width: info.width,
+        height: info.height,
+        createdAt: new Date().toISOString(),
+      };
+      saveSource(source);
+      log(`ingested ${id}: ${source.title} (${source.durationSec}s)`);
+      return source;
+    } catch (err) {
+      fs.rmSync(dir, { recursive: true, force: true });
+      throw err;
+    }
   }
 
   // Local file.
@@ -101,43 +105,48 @@ export async function ingest(input: string, creator: string): Promise<Source> {
   const id = newId('src');
   const dir = paths.source(id);
   fs.mkdirSync(dir, { recursive: true });
-  const audioPath = path.join(dir, 'audio.wav');
-  const proxyPath = path.join(dir, 'proxy.mp4');
+  try {
+    const audioPath = path.join(dir, 'audio.wav');
+    const proxyPath = path.join(dir, 'proxy.mp4');
 
-  const doneAudio = step(`extracting audio (${path.basename(filePath)})`);
-  await runOk(ffmpeg(), ['-y', '-i', filePath, '-ac', '1', '-ar', '16000', '-c:a', 'pcm_s16le', audioPath]);
-  doneAudio();
+    const doneAudio = step(`extracting audio (${path.basename(filePath)})`);
+    await runOk(ffmpeg(), ['-y', '-i', filePath, '-ac', '1', '-ar', '16000', '-c:a', 'pcm_s16le', audioPath]);
+    doneAudio();
 
-  const doneProxy = step(`building proxy (${path.basename(filePath)})`);
-  await runOk(ffmpeg(), [
-    '-y',
-    '-i',
-    filePath,
-    '-an',
-    '-vf',
-    'scale=-2:360',
-    '-c:v',
-    'libx264',
-    '-preset',
-    'veryfast',
-    '-crf',
-    '28',
-    proxyPath,
-  ]);
-  doneProxy();
+    const doneProxy = step(`building proxy (${path.basename(filePath)})`);
+    await runOk(ffmpeg(), [
+      '-y',
+      '-i',
+      filePath,
+      '-an',
+      '-vf',
+      'scale=-2:360',
+      '-c:v',
+      'libx264',
+      '-preset',
+      'veryfast',
+      '-crf',
+      '28',
+      proxyPath,
+    ]);
+    doneProxy();
 
-  const source: Source = {
-    id,
-    creator,
-    kind: 'file',
-    filePath,
-    title: path.basename(filePath, path.extname(filePath)),
-    durationSec: probe.durationSec,
-    width: probe.width,
-    height: probe.height,
-    createdAt: new Date().toISOString(),
-  };
-  saveSource(source);
-  log(`ingested ${id}: ${source.title} (${source.durationSec}s)`);
-  return source;
+    const source: Source = {
+      id,
+      creator,
+      kind: 'file',
+      filePath,
+      title: path.basename(filePath, path.extname(filePath)),
+      durationSec: probe.durationSec,
+      width: probe.width,
+      height: probe.height,
+      createdAt: new Date().toISOString(),
+    };
+    saveSource(source);
+    log(`ingested ${id}: ${source.title} (${source.durationSec}s)`);
+    return source;
+  } catch (err) {
+    fs.rmSync(dir, { recursive: true, force: true });
+    throw err;
+  }
 }
