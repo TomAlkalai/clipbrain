@@ -12,7 +12,9 @@ import { ingest } from './ingest.js';
 import { transcribeSource } from './analyze/transcribe.js';
 import { scanVisual, computeFaceStats, writeFaceDebugSheets } from './analyze/visual.js';
 import { analyzeSource } from './analyze/analyze.js';
-import type { Creator, Shot, FaceSample } from './types.js';
+import { selectSource, openingClosing } from './select/select.js';
+import { mmss } from './select/propose.js';
+import type { Creator, Shot, FaceSample, Sentence } from './types.js';
 
 // A flag value is a single string/boolean normally, or an array when the same
 // `--flag` was passed more than once on the command line (e.g. repeated `--shorts-url`).
@@ -296,6 +298,42 @@ export const commands: Record<string, { help: string; run: (a: ParsedArgs) => Pr
       }
       await analyzeSource(sourceId, { force: Boolean(a.flags.force) });
       log(`analyze ${sourceId}: done`);
+    },
+  },
+  select: {
+    help: 'select <sourceId> [--top 6] [--force] [--text] — propose, snap, dedupe and rank clip candidates.',
+    async run(a) {
+      const sourceId = a._[0];
+      if (!sourceId) {
+        log('usage: cb select <sourceId> [--top 6] [--force] [--text]');
+        process.exitCode = 1;
+        return;
+      }
+      setBackend(claudeBackend);
+      const top = Number(asString(a.flags.top) ?? 6) || 6;
+      const candidates = await selectSource(sourceId, { top, force: Boolean(a.flags.force) });
+      const shortlisted = candidates.filter((c) => c.shortlisted).sort((x, y) => (x.rank ?? 0) - (y.rank ?? 0));
+
+      console.log('rank  start–end          dur   composite  title');
+      for (const c of shortlisted) {
+        const dur = `${Math.round(c.end - c.start)}s`;
+        console.log(
+          `${String(c.rank).padEnd(5)} ${mmss(c.start)}–${mmss(c.end)}`.padEnd(24) +
+            `${dur.padEnd(6)}${c.composite.toFixed(2).padEnd(11)}${c.title}`,
+        );
+      }
+
+      if (a.flags.text) {
+        const sentences = readJson<Sentence[]>(path.join(paths.source(sourceId), 'sentences.json'));
+        for (const c of shortlisted) {
+          const { opening, closing } = openingClosing(sentences, c);
+          console.log(`\n[#${c.rank}] ${c.title}  (${mmss(c.start)}–${mmss(c.end)})`);
+          console.log('  opening:');
+          for (const s of opening) console.log(`    [${s.id}] (${mmss(s.start)}) ${s.text}`);
+          console.log('  closing:');
+          for (const s of closing) console.log(`    [${s.id}] (${mmss(s.start)}) ${s.text}`);
+        }
+      }
     },
   },
   'faces-smoke': {
