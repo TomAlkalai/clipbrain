@@ -1,5 +1,7 @@
 import { doctor as runDoctor, setup as runSetup } from './tools/bins.js';
 import { log } from './log.js';
+import { llmJson, setBackend, ledgerSummary } from './llm/llm.js';
+import { claudeBackend } from './llm/claude.js';
 
 export type ParsedArgs = { _: string[]; flags: Record<string, string | boolean> };
 
@@ -56,6 +58,33 @@ export const commands: Record<string, { help: string; run: (a: ParsedArgs) => Pr
       await runSetup();
       const ok = await printDoctorReport();
       if (!ok) process.exitCode = 1;
+    },
+  },
+  'llm-smoke': {
+    help: 'Make one real LLM call (fast tier) and print the result and ledger summary.',
+    async run() {
+      setBackend(claudeBackend);
+      const result = await llmJson<{ ok: boolean }>({
+        tier: 'fast',
+        purpose: 'smoke',
+        system: 'You return JSON only.',
+        prompt: 'Return ok=true.',
+        schema: { type: 'object', properties: { ok: { type: 'boolean' } }, required: ['ok'] },
+        noCache: true,
+      });
+      log('result:', JSON.stringify(result));
+      log('ledger:', JSON.stringify(ledgerSummary()));
+    },
+  },
+  ledger: {
+    help: 'Print the LLM ledger summary as a table.',
+    async run() {
+      const s = ledgerSummary();
+      log(`calls=${s.calls} cached=${s.cached} costUsd=${s.costUsd.toFixed(4)}`);
+      console.log('purpose'.padEnd(24), 'calls'.padEnd(8), 'costUsd');
+      for (const [purpose, v] of Object.entries(s.byPurpose)) {
+        console.log(purpose.padEnd(24), String(v.calls).padEnd(8), v.costUsd.toFixed(4));
+      }
     },
   },
 };
