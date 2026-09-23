@@ -13,6 +13,11 @@ export type Letterboxed = { data: Float32Array; padTop: number; contentH: number
  */
 export function letterbox(rgb: Buffer, w: number, h: number): Letterboxed {
   if (w !== INPUT_W) throw new Error(`letterbox expects a ${INPUT_W}-wide frame, got ${w}`);
+  if (h > INPUT_H) {
+    throw new Error(
+      `letterbox: frame height ${h} exceeds ${INPUT_H} at ${INPUT_W} width (aspect too tall/portrait for letterbox-only padding) — cropping/scaling is required upstream instead of silently dropping rows`,
+    );
+  }
   const contentH = h;
   const padTop = Math.floor((INPUT_H - contentH) / 2);
   const data = new Float32Array(3 * INPUT_H * INPUT_W);

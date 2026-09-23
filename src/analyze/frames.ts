@@ -17,7 +17,12 @@ export async function* readFrames(file: string, o: ReadFramesOpts): AsyncGenerat
   args.push('-vf', `fps=${fps},scale=${width}:${height}`, '-f', 'rawvideo', '-pix_fmt', 'rgb24', 'pipe:1');
 
   const child = spawnStream(ffmpeg(), args);
-  child.stderr?.resume();
+
+  const STDERR_TAIL_BYTES = 4096;
+  let stderrTail = '';
+  child.stderr?.on('data', (d: Buffer) => {
+    stderrTail = (stderrTail + d.toString('utf8')).slice(-STDERR_TAIL_BYTES);
+  });
 
   let buffered: Buffer = Buffer.alloc(0);
   let n = 0;
@@ -37,7 +42,15 @@ export async function* readFrames(file: string, o: ReadFramesOpts): AsyncGenerat
     buffered = buffered.length === 0 ? d : Buffer.concat([buffered, d]);
     wake();
   });
-  child.on('close', () => { ended = true; wake(); });
+  child.on('close', (code, signal) => {
+    if (code !== 0 || signal) {
+      error = new Error(
+        `ffmpeg exited with code ${code}${signal ? ` (signal ${signal})` : ''} reading ${file}: ${stderrTail.trim()}`,
+      );
+    }
+    ended = true;
+    wake();
+  });
   child.on('error', (err) => { error = err instanceof Error ? err : new Error(String(err)); ended = true; wake(); });
 
   try {

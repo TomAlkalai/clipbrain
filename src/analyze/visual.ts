@@ -73,6 +73,10 @@ export async function scanVisual(sourceId: string, o?: ScanVisualOpts): Promise<
     }
   }
 
+  if (frameIndex === 0) {
+    throw new Error(`scanVisual ${sourceId}: ffmpeg decoded 0 frames from ${proxyPath} — refusing to write empty results`);
+  }
+
   const shots = detectShots(diffs, durationSec);
   writeJson(shotsPath, shots);
   writeJson(facesPath, faceSamples);
