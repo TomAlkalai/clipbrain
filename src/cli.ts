@@ -5,6 +5,8 @@ import { claudeBackend } from './llm/claude.js';
 import { listChannel, fetchSubs } from './yt/ytdlp.js';
 import { saveCreator, listCreators } from './store.js';
 import { mineCreator } from './mine/mine.js';
+import { loadPlaybook, savePlaybook, renderPlaybookMd } from './playbook/playbook.js';
+import { distill } from './playbook/distill.js';
 import type { Creator } from './types.js';
 
 // A flag value is a single string/boolean normally, or an array when the same
@@ -216,6 +218,26 @@ export const commands: Record<string, { help: string; run: (a: ParsedArgs) => Pr
       log(
         `mine ${slug}: nShorts=${result.nShorts} withSubs=${result.withSubs} aligned=${result.aligned} episodesIndexed=${result.episodesIndexed}`,
       );
+    },
+  },
+  playbook: {
+    help: 'playbook <slug> [--distill] — print a creator\'s playbook as markdown; --distill re-mines it from features.json first.',
+    async run(a) {
+      const slug = a._[0];
+      if (!slug) {
+        log('usage: cb playbook <slug> [--distill]');
+        process.exitCode = 1;
+        return;
+      }
+      if (a.flags.distill) {
+        setBackend(claudeBackend);
+        const pb = await distill(slug);
+        savePlaybook(pb);
+        console.log(renderPlaybookMd(pb));
+        return;
+      }
+      const pb = loadPlaybook(slug);
+      console.log(renderPlaybookMd(pb));
     },
   },
 };
