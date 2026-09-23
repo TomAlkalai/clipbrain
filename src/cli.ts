@@ -7,6 +7,8 @@ import { saveCreator, listCreators } from './store.js';
 import { mineCreator } from './mine/mine.js';
 import { loadPlaybook, savePlaybook, renderPlaybookMd } from './playbook/playbook.js';
 import { distill } from './playbook/distill.js';
+import { ingest } from './ingest.js';
+import { transcribeSource } from './analyze/transcribe.js';
 import type { Creator } from './types.js';
 
 // A flag value is a single string/boolean normally, or an array when the same
@@ -238,6 +240,33 @@ export const commands: Record<string, { help: string; run: (a: ParsedArgs) => Pr
       }
       const pb = loadPlaybook(slug);
       console.log(renderPlaybookMd(pb));
+    },
+  },
+  ingest: {
+    help: 'ingest <url|file> --creator <slug> — download audio + a <=360p proxy, prints the source id.',
+    async run(a) {
+      const input = a._[0];
+      const creator = asString(a.flags.creator);
+      if (!input || !creator) {
+        log('usage: cb ingest <url|file> --creator <slug>');
+        process.exitCode = 1;
+        return;
+      }
+      const source = await ingest(input, creator);
+      console.log(source.id);
+    },
+  },
+  transcribe: {
+    help: 'transcribe <sourceId> — whisper.cpp transcription with word timestamps (writes words.json, sentences.json).',
+    async run(a) {
+      const sourceId = a._[0];
+      if (!sourceId) {
+        log('usage: cb transcribe <sourceId>');
+        process.exitCode = 1;
+        return;
+      }
+      const words = await transcribeSource(sourceId);
+      log(`words: ${words.length}`);
     },
   },
 };
