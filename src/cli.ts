@@ -11,6 +11,7 @@ import { distill } from './playbook/distill.js';
 import { ingest } from './ingest.js';
 import { transcribeSource } from './analyze/transcribe.js';
 import { scanVisual, computeFaceStats, writeFaceDebugSheets } from './analyze/visual.js';
+import { analyzeSource } from './analyze/analyze.js';
 import type { Creator, Shot, FaceSample } from './types.js';
 
 // A flag value is a single string/boolean normally, or an array when the same
@@ -282,6 +283,19 @@ export const commands: Record<string, { help: string; run: (a: ParsedArgs) => Pr
       }
       const result = await scanVisual(sourceId, { force: Boolean(a.flags.force) });
       log(`scan ${sourceId}: ${result.shots} shots, ${result.samples} face samples`);
+    },
+  },
+  analyze: {
+    help: 'analyze <sourceId> [--force] — run transcribe, silence detection and visual scan in order.',
+    async run(a) {
+      const sourceId = a._[0];
+      if (!sourceId) {
+        log('usage: cb analyze <sourceId> [--force]');
+        process.exitCode = 1;
+        return;
+      }
+      await analyzeSource(sourceId, { force: Boolean(a.flags.force) });
+      log(`analyze ${sourceId}: done`);
     },
   },
   'faces-smoke': {
