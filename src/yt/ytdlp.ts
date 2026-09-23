@@ -79,25 +79,33 @@ export async function listChannel(url: string, tab: 'shorts' | 'videos', limit: 
     if (cached) return cached;
   }
 
-  const args = [...baseArgs(), '--flat-playlist', '-J', '--playlist-end', String(limit), `${url}/${tab}`];
+  const args = [...baseArgs(), '--flat-playlist', '-J', '--sleep-requests', '1', '--playlist-end', String(limit), `${url}/${tab}`];
   const r = await runOk(ytdlp(), args, { timeoutMs: LISTING_TIMEOUT_MS });
   const json = JSON.parse(r.stdout);
   const list = mapFlatEntries(json, url);
 
+  let enrichmentFailed = false;
   if (tab === 'shorts') {
-    const targets = list.slice(0, limit).filter((e) => e.uploadDate === '');
+    const targets = list.slice(0, limit).filter((e) => e.uploadDate === '' || e.durationSec === 0);
     for (let i = 0; i < targets.length; i++) {
       if (i > 0) await sleep(1000);
       try {
         const info = await videoInfo(targets[i].id);
         targets[i].uploadDate = info.uploadDate;
+        targets[i].durationSec = info.durationSec;
+        targets[i].views = info.views;
       } catch (err) {
+        enrichmentFailed = true;
         log(`videoInfo enrichment failed for ${targets[i].id}:`, err instanceof Error ? err.message : String(err));
       }
     }
   }
 
-  writeJson(cachePath, list);
+  // Skip caching a partially-enriched list so the next call retries the missing fields
+  // instead of locking in zeros/blanks for 12h.
+  if (!enrichmentFailed) {
+    writeJson(cachePath, list);
+  }
   return list;
 }
 
@@ -115,7 +123,8 @@ export type VideoInfo = {
 
 export async function videoInfo(urlOrId: string): Promise<VideoInfo> {
   const url = /^https?:\/\//i.test(urlOrId) ? urlOrId : `https://www.youtube.com/watch?v=${urlOrId}`;
-  const args = [...baseArgs(), '-J', '--no-playlist', '--skip-download', url];
+  // --sleep-requests: videoInfo is called in a loop from listChannel's per-short enrichment pass.
+  const args = [...baseArgs(), '-J', '--no-playlist', '--skip-download', '--sleep-requests', '1', url];
   const r = await runOk(ytdlp(), args, { timeoutMs: VIDEO_INFO_TIMEOUT_MS });
   const j = JSON.parse(r.stdout);
   return {
@@ -156,6 +165,8 @@ export async function fetchSubs(videoId: string): Promise<Word[] | null> {
       'en,en-orig,en-US,en-GB',
       '--sub-format',
       'json3',
+      '--sleep-requests',
+      '1', // fetches up to 4 subtitle language variants in one invocation — a batch of requests
       '-o',
       path.join(dir, '%(id)s.%(ext)s'),
       `https://www.youtube.com/watch?v=${videoId}`,
