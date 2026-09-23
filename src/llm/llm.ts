@@ -54,13 +54,12 @@ class Semaphore {
   }
 }
 
+// Sized once from the env on first use; later changes to CB_LLM_CONCURRENCY don't resize
+// it (that would let in-flight callers race a shrinking/growing pool mid-run).
 let semaphore: Semaphore | undefined;
-let semaphoreSize: number | undefined;
 function getSemaphore(): Semaphore {
-  const size = Number(env('CB_LLM_CONCURRENCY', '3'));
-  if (!semaphore || semaphoreSize !== size) {
-    semaphore = new Semaphore(size);
-    semaphoreSize = size;
+  if (!semaphore) {
+    semaphore = new Semaphore(Number(env('CB_LLM_CONCURRENCY', '3')));
   }
   return semaphore;
 }
