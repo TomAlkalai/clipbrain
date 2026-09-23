@@ -1,15 +1,17 @@
+import path from 'node:path';
 import { doctor as runDoctor, setup as runSetup } from './tools/bins.js';
 import { log } from './log.js';
 import { llmJson, setBackend, ledgerSummary } from './llm/llm.js';
 import { claudeBackend } from './llm/claude.js';
 import { listChannel, fetchSubs } from './yt/ytdlp.js';
-import { saveCreator, listCreators } from './store.js';
+import { saveCreator, listCreators, paths, readJson } from './store.js';
 import { mineCreator } from './mine/mine.js';
 import { loadPlaybook, savePlaybook, renderPlaybookMd } from './playbook/playbook.js';
 import { distill } from './playbook/distill.js';
 import { ingest } from './ingest.js';
 import { transcribeSource } from './analyze/transcribe.js';
-import type { Creator } from './types.js';
+import { scanVisual, computeFaceStats, writeFaceDebugSheets } from './analyze/visual.js';
+import type { Creator, Shot, FaceSample } from './types.js';
 
 // A flag value is a single string/boolean normally, or an array when the same
 // `--flag` was passed more than once on the command line (e.g. repeated `--shorts-url`).
@@ -267,6 +269,45 @@ export const commands: Record<string, { help: string; run: (a: ParsedArgs) => Pr
       }
       const words = await transcribeSource(sourceId);
       log(`words: ${words.length}`);
+    },
+  },
+  scan: {
+    help: 'scan <sourceId> [--force] — visual scan of proxy.mp4: shot boundaries + per-second face boxes.',
+    async run(a) {
+      const sourceId = a._[0];
+      if (!sourceId) {
+        log('usage: cb scan <sourceId> [--force]');
+        process.exitCode = 1;
+        return;
+      }
+      const result = await scanVisual(sourceId, { force: Boolean(a.flags.force) });
+      log(`scan ${sourceId}: ${result.shots} shots, ${result.samples} face samples`);
+    },
+  },
+  'faces-smoke': {
+    help: 'faces-smoke <sourceId> — print shot/face stats from an existing scan and write debug contact sheets with face boxes drawn on.',
+    async run(a) {
+      const sourceId = a._[0];
+      if (!sourceId) {
+        log('usage: cb faces-smoke <sourceId>');
+        process.exitCode = 1;
+        return;
+      }
+      const dir = paths.source(sourceId);
+      const shots = readJson<Shot[]>(path.join(dir, 'shots.json'));
+      const faces = readJson<FaceSample[]>(path.join(dir, 'faces.json'));
+      const stats = computeFaceStats(shots, faces);
+      console.log(`shots: ${stats.shots}`);
+      console.log(`median shot length: ${stats.medianShotLen.toFixed(2)}s`);
+      console.log(`face samples: ${stats.samples}`);
+      console.log(`% samples with >=1 face: ${stats.pctWithFace.toFixed(1)}%`);
+      console.log(`% samples with >=2 faces: ${stats.pctWith2Faces.toFixed(1)}%`);
+
+      const sheets = await writeFaceDebugSheets(sourceId, 6);
+      log(`wrote ${sheets.length} debug contact sheet(s):`);
+      for (const s of sheets) {
+        console.log(`  t=${s.t.toFixed(1)}s  faces=${s.faces.length}  ${s.jpgPath}`);
+      }
     },
   },
 };
