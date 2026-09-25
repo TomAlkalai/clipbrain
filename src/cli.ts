@@ -4,7 +4,7 @@ import { log } from './log.js';
 import { llmJson, setBackend, ledgerSummary } from './llm/llm.js';
 import { claudeBackend } from './llm/claude.js';
 import { listChannel, fetchSubs } from './yt/ytdlp.js';
-import { saveCreator, listCreators, paths, readJson } from './store.js';
+import { saveCreator, listCreators, paths, readJson, loadSource, loadCreator } from './store.js';
 import { mineCreator } from './mine/mine.js';
 import { loadPlaybook, savePlaybook, renderPlaybookMd } from './playbook/playbook.js';
 import { distill } from './playbook/distill.js';
@@ -14,7 +14,8 @@ import { scanVisual, computeFaceStats, writeFaceDebugSheets } from './analyze/vi
 import { analyzeSource } from './analyze/analyze.js';
 import { selectSource, openingClosing } from './select/select.js';
 import { mmss } from './select/propose.js';
-import type { Creator, Shot, FaceSample, Sentence } from './types.js';
+import { generateHooks } from './hooks/hooks.js';
+import type { Creator, Shot, FaceSample, Sentence, Candidate } from './types.js';
 
 // A flag value is a single string/boolean normally, or an array when the same
 // `--flag` was passed more than once on the command line (e.g. repeated `--shorts-url`).
@@ -334,6 +335,59 @@ export const commands: Record<string, { help: string; run: (a: ParsedArgs) => Pr
           for (const s of closing) console.log(`    [${s.id}] (${mmss(s.start)}) ${s.text}`);
         }
       }
+    },
+  },
+  'hooks-smoke': {
+    help: 'hooks-smoke <sourceId> [--rank 1] — generate hooks/title/description/cold-open for one shortlisted candidate (live LLM call).',
+    async run(a) {
+      const sourceId = a._[0];
+      if (!sourceId) {
+        log('usage: cb hooks-smoke <sourceId> [--rank 1]');
+        process.exitCode = 1;
+        return;
+      }
+      const rank = Number(asString(a.flags.rank) ?? 1) || 1;
+      const dir = paths.source(sourceId);
+      const source = loadSource(sourceId);
+      const creator = loadCreator(source.creator);
+      const sentences = readJson<Sentence[]>(path.join(dir, 'sentences.json'));
+      const candidates = readJson<Candidate[]>(path.join(dir, 'candidates.json'));
+      const candidate = candidates.find((c) => c.shortlisted && c.rank === rank);
+      if (!candidate) {
+        log(`no shortlisted candidate with rank ${rank} in ${sourceId}`);
+        process.exitCode = 1;
+        return;
+      }
+      const pb = loadPlaybook(source.creator);
+      setBackend(claudeBackend);
+
+      const result = await generateHooks({
+        creatorName: creator.name,
+        episodeTitle: source.title,
+        pb,
+        sentences,
+        startSid: candidate.startSid,
+        endSid: candidate.endSid,
+        candidateTitle: candidate.title,
+        summary: candidate.summary,
+      });
+
+      console.log(`[#${rank}] ${candidate.title}  (${mmss(candidate.start)}–${mmss(candidate.end)})`);
+      console.log('\nhooks:');
+      for (const h of result.hooks) {
+        console.log(`  (${h.score.toFixed(1)}) [${h.pattern}] ${h.text}`);
+      }
+      console.log(`\ntitle: ${result.title}`);
+      console.log(`description: ${result.description}`);
+      console.log(`hashtags: ${result.hashtags.join(', ')}`);
+      if (result.coldOpenSid !== null) {
+        const s = sentences[result.coldOpenSid];
+        console.log(`\ncold open: [${result.coldOpenSid}] (${mmss(s.start)}, ${(s.end - s.start).toFixed(1)}s) ${s.text}`);
+      } else {
+        console.log('\ncold open: none');
+      }
+      console.log(`cold-open reason: ${result.coldOpenReason}`);
+      log('ledger:', JSON.stringify(ledgerSummary()));
     },
   },
   'faces-smoke': {
