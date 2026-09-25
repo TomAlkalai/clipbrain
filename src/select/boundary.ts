@@ -46,9 +46,12 @@ function renderSentences(items: Sentence[]): string {
 
 /** One LLM call (tier `fast`) checking whether a candidate's opening and ending stand alone. */
 export async function checkBoundaries(c: Candidate, sentences: Sentence[], o: { minSec: number; maxSec: number }): Promise<BoundaryCheck> {
+  // Bounded on the clip's own side too (not just the array), so a short clip (fewer than 4/3
+  // sentences) doesn't have "opening" spill past endSid into what's really the AFTER group, or
+  // "closing" spill before startSid into what's really the BEFORE group.
   const before = sentences.slice(Math.max(0, c.startSid - 5), c.startSid);
-  const opening = sentences.slice(c.startSid, Math.min(sentences.length, c.startSid + 4));
-  const closing = sentences.slice(Math.max(c.startSid, c.endSid - 2), c.endSid + 1);
+  const opening = sentences.slice(c.startSid, Math.min(sentences.length, c.startSid + 4, c.endSid + 1));
+  const closing = sentences.slice(Math.max(c.startSid, c.endSid - 2), Math.min(sentences.length, c.endSid + 1));
   const after = sentences.slice(c.endSid + 1, Math.min(sentences.length, c.endSid + 4));
 
   const prompt =

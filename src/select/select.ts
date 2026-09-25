@@ -122,18 +122,23 @@ export async function selectSource(sourceId: string, o?: SelectOpts): Promise<Ca
   // lower instead of silently shipping.
   const boundsForCheck = { minSec, maxSec, weights: pb.weights };
   const checks = await Promise.all(pool.map((c) => checkBoundaries(c, sentences, { minSec, maxSec })));
-  const checkedPool = pool
-    .map((c, i) => applyBoundaryCheck(c, checks[i], sentences, words, boundsForCheck))
-    .sort((a, b) => b.composite - a.composite);
+  const checkedPool = pool.map((c, i) => applyBoundaryCheck(c, checks[i], sentences, words, boundsForCheck));
   const repairedCount = checkedPool.filter((c) => c.boundary?.repaired).length;
   const penalizedCount = checkedPool.filter((c) => c.boundary && !c.boundary.repaired && (!c.boundary.openingStandalone || !c.boundary.endingComplete)).length;
   log(`selectSource ${sourceId}: boundary check repaired ${repairedCount}/${checkedPool.length}, penalized ${penalizedCount}/${checkedPool.length}`);
 
-  const ranking = await finalRank(checkedPool, sentences, creator.name, pbBlock, top);
+  // A repair can move two different candidates onto the identical [startSid, endSid] — since
+  // candidateId is deterministic, they'd then carry the same id (a collision dedupe run only
+  // BEFORE repairs can't catch, because it never saw the post-repair ranges). Re-dedupe the
+  // checked pool together with the untouched rest: identical ranges have IoU 1, so dedupe keeps
+  // only the higher-composite one. Re-slice into a (possibly smaller) top-TOP_POOL pool for
+  // finalRank and everything else as "rest", same convention as the first pool/rest split above.
+  const dedupedAfterCheck = dedupe([...checkedPool, ...rest]);
+  const finalPool = dedupedAfterCheck.slice(0, TOP_POOL);
+  const ranking = await finalRank(finalPool, sentences, creator.name, pbBlock, top);
 
-  const allCandidates = [...checkedPool, ...rest];
   const rankById = new Map(ranking.map((r, i) => [r.id, { rank: i + 1, reason: r.reason }]));
-  for (const c of allCandidates) {
+  for (const c of dedupedAfterCheck) {
     const r = rankById.get(c.id);
     if (r) {
       c.rank = r.rank;
@@ -142,12 +147,20 @@ export async function selectSource(sourceId: string, o?: SelectOpts): Promise<Ca
     }
   }
 
-  const sorted = [...allCandidates].sort((a, b) => {
+  const sorted = [...dedupedAfterCheck].sort((a, b) => {
     if (a.shortlisted && b.shortlisted) return (a.rank ?? 0) - (b.rank ?? 0);
     if (a.shortlisted) return -1;
     if (b.shortlisted) return 1;
     return b.composite - a.composite;
   });
+
+  const seenIds = new Set<string>();
+  for (const c of sorted) {
+    if (seenIds.has(c.id)) {
+      throw new Error(`selectSource ${sourceId}: duplicate candidate id ${c.id} survived dedupe — refusing to write candidates.json`);
+    }
+    seenIds.add(c.id);
+  }
 
   fs.mkdirSync(dir, { recursive: true });
   writeJson(outPath, sorted);
