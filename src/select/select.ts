@@ -3,11 +3,12 @@ import fs from 'node:fs';
 import { paths, loadSource, loadCreator, readJson, readJsonOr, writeJson } from '../store.js';
 import { loadPlaybook, playbookPromptBlock } from '../playbook/playbook.js';
 import { log, step } from '../log.js';
-import type { Sentence, Word, Candidate } from '../types.js';
+import type { Sentence, Word, Candidate, Shot, FaceSample } from '../types.js';
 import { windows, snapBounds, composite, dedupe, mergeFragmentedSentences, candidateId } from './snap.js';
 import { proposeWindow } from './propose.js';
 import { finalRank } from './rank.js';
 import { checkBoundaries, applyBoundaryCheck } from './boundary.js';
+import { visualMetrics, visualScore, visionCheck } from './visual.js';
 
 const TOP_POOL = 20; // how many deduped candidates (by composite) get sent to the final-rank call
 
@@ -135,6 +136,42 @@ export async function selectSource(sourceId: string, o?: SelectOpts): Promise<Ca
   // finalRank and everything else as "rest", same convention as the first pool/rest split above.
   const dedupedAfterCheck = dedupe([...checkedPool, ...rest]);
   const finalPool = dedupedAfterCheck.slice(0, TOP_POOL);
+
+  // Visual fitness: a clip can be strong on paper (transcript-only scores) and bad on screen —
+  // no visible subject, nothing to crop tight on, jittery cuts, or a slide/ad burned into the
+  // frame. For the top pool only (this is where the vision LLM calls live, kept cheap by being
+  // scoped to a handful of finalists rather than every proposed candidate), combine the source's
+  // shot/face scan (metrics, pure/free) with a focused per-candidate keyframe vision check
+  // (LLM, tier `fast`) and fold the result into candidate.visual + a composite penalty.
+  const shots = readJsonOr<Shot[]>(path.join(dir, 'shots.json'), []);
+  const faces = readJsonOr<FaceSample[]>(path.join(dir, 'faces.json'), []);
+  const srcAspect = source.width / source.height;
+  const framesDir = path.join(dir, 'frames');
+
+  const doneVisual = step(`selectSource ${sourceId}: visual fitness check on ${finalPool.length} candidate(s)`);
+  await Promise.all(
+    finalPool.map(async (c) => {
+      const metrics = visualMetrics(c.start, c.end, shots, faces, srcAspect);
+      const { score: metricScore, issues: metricIssues } = visualScore(metrics);
+
+      let visionIssues: string[] = [];
+      try {
+        const vision = await visionCheck(c, framesDir);
+        visionIssues = vision.issues;
+      } catch (err) {
+        log(`selectSource ${sourceId}: visionCheck failed for ${c.id}, treating as no vision issues: ${err instanceof Error ? err.message : String(err)}`);
+      }
+      const visionDeduction = Math.min(3, visionIssues.length);
+      const score = Math.max(0, Math.min(10, metricScore - visionDeduction));
+
+      c.visual = { score, metrics, issues: [...metricIssues, ...visionIssues] };
+      if (score < 5) {
+        c.composite = Math.round((c.composite - (5 - score) * 0.4) * 100) / 100;
+      }
+    }),
+  );
+  doneVisual();
+
   const ranking = await finalRank(finalPool, sentences, creator.name, pbBlock, top);
 
   const rankById = new Map(ranking.map((r, i) => [r.id, { rank: i + 1, reason: r.reason }]));

@@ -26,7 +26,11 @@ function cacheKey(model: string, system: string, prompt: string, schema: object)
   return crypto.createHash('sha256').update(s).digest('hex');
 }
 
-function cachePath(key: string): string {
+// Exported (unlike the model/system/prompt/schema-keyed `cacheKey` above) so llm/vision.ts can
+// share this exact cache directory under its own cache-key formula (which also folds in each
+// image's sha1) without duplicating — or accidentally diverging from — where llmJson's own
+// cache lives.
+export function cachePath(key: string): string {
   return path.join(CACHE_DIR(), `${key}.json`);
 }
 
@@ -55,20 +59,23 @@ class Semaphore {
 }
 
 // Sized once from the env on first use; later changes to CB_LLM_CONCURRENCY don't resize
-// it (that would let in-flight callers race a shrinking/growing pool mid-run).
+// it (that would let in-flight callers race a shrinking/growing pool mid-run). Exported so
+// llm/vision.ts's calls share the same concurrency cap as llmJson's rather than adding their
+// own uncapped pool of claude CLI spawns on top.
 let semaphore: Semaphore | undefined;
-function getSemaphore(): Semaphore {
+export function getSemaphore(): Semaphore {
   if (!semaphore) {
     semaphore = new Semaphore(Number(env('CB_LLM_CONCURRENCY', '3')));
   }
   return semaphore;
 }
 
-function sleep(ms: number): Promise<void> {
+export function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
-function logLedger(entry: LedgerEntry): void {
+// Exported so llm/vision.ts logs to the exact same ledger file as llmJson.
+export function logLedger(entry: LedgerEntry): void {
   appendJsonl(LEDGER_PATH(), entry);
 }
 

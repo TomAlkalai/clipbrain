@@ -31,11 +31,17 @@ export type Source = {
   title: string; durationSec: number; width: number; height: number; createdAt: string;
 };
 
+export type VisualMetrics = {
+  faceCoverage: number; twoShotRatio: number; fitRatio: number;
+  cutsPerMin: number; medianFaceH: number; longestNoFaceSec: number;
+};
+
 export type Candidate = {
   id: string; sourceId: string; startSid: number; endSid: number; start: number; end: number;
   title: string; summary: string; why: string; patterns: string[]; scores: Scores; composite: number;
   rank?: number; rankReason?: string; shortlisted: boolean;
   boundary?: { openingStandalone: boolean; endingComplete: boolean; repaired: boolean; notes: string };
+  visual?: { score: number; metrics: VisualMetrics; issues: string[] };
 };
 
 export type Hook = { text: string; pattern: string; score: number };

@@ -31,11 +31,14 @@ function candidateLine(c: Candidate, sentences: Sentence[]): string {
   const dur = Math.round(c.end - c.start);
   const opening = sentences[c.startSid]?.text ?? '';
   const scores = SIGNALS.map((s) => `${s} ${c.scores[s].score} (${c.scores[s].reason})`).join(' · ');
+  const visualLine = c.visual
+    ? `\nvisual: ${c.visual.score}/10 — ${c.visual.issues.length ? c.visual.issues.join('; ') : 'none'}`
+    : '';
   return (
     `${c.id} | ${mmss(c.start)}–${mmss(c.end)} (${dur}s) | ${c.composite} | ${c.title}\n` +
     `${c.summary}\n${c.why}\n` +
     `opening sentence: "${opening}"\n` +
-    `scores: ${scores}`
+    `scores: ${scores}${visualLine}`
   );
 }
 
