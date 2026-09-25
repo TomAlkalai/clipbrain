@@ -1,0 +1,68 @@
+import React from 'react';
+import { AbsoluteFill, spring, useCurrentFrame, useVideoConfig } from 'remotion';
+import { loadFont } from '@remotion/google-fonts/Montserrat';
+import type { EdlCaption } from '../src/types';
+
+const { fontFamily } = loadFont();
+
+const PAGE_ENTRY_FRAMES = 6;
+
+export const Captions: React.FC<{ captions: EdlCaption[]; st: { accent: string; captionTop: number } }> = ({
+  captions,
+  st,
+}) => {
+  const frame = useCurrentFrame();
+  const { fps } = useVideoConfig();
+  const t = frame / fps;
+  const page = captions.find((c) => t >= c.start && t < c.end);
+  if (!page) return null;
+
+  const pageStartFrame = Math.round(page.start * fps);
+  const scale = spring({
+    frame: frame - pageStartFrame,
+    fps,
+    config: { damping: 200 },
+    durationInFrames: PAGE_ENTRY_FRAMES,
+    from: 0.85,
+    to: 1,
+  });
+
+  return (
+    <AbsoluteFill style={{ top: st.captionTop, alignItems: 'center', justifyContent: 'flex-start' }}>
+      <div
+        style={{
+          transform: `scale(${scale})`,
+          display: 'flex',
+          flexWrap: 'wrap',
+          justifyContent: 'center',
+          alignItems: 'baseline',
+          maxWidth: 960,
+          columnGap: 22,
+          rowGap: 6,
+          padding: '0 24px',
+        }}
+      >
+        {page.words.map((w, idx) => {
+          const active = t >= w.start && t < w.end;
+          return (
+            <span
+              key={idx}
+              style={{
+                fontFamily,
+                fontWeight: 900,
+                fontSize: 84,
+                textTransform: 'uppercase',
+                color: active ? st.accent : '#fff',
+                WebkitTextStroke: '10px #000',
+                paintOrder: 'stroke fill',
+                textShadow: '0 6px 14px rgba(0,0,0,0.65)',
+              }}
+            >
+              {w.w}
+            </span>
+          );
+        })}
+      </div>
+    </AbsoluteFill>
+  );
+};

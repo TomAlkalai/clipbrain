@@ -1,10 +1,10 @@
 import path from 'node:path';
 import { doctor as runDoctor, setup as runSetup } from './tools/bins.js';
-import { log } from './log.js';
+import { log, step } from './log.js';
 import { llmJson, setBackend, ledgerSummary } from './llm/llm.js';
 import { claudeBackend } from './llm/claude.js';
 import { listChannel, fetchSubs } from './yt/ytdlp.js';
-import { saveCreator, listCreators, paths, readJson, loadSource, loadCreator } from './store.js';
+import { saveCreator, listCreators, paths, readJson, loadSource, loadCreator, newId, saveClip } from './store.js';
 import { mineCreator } from './mine/mine.js';
 import { loadPlaybook, savePlaybook, renderPlaybookMd } from './playbook/playbook.js';
 import { distill } from './playbook/distill.js';
@@ -15,7 +15,9 @@ import { analyzeSource } from './analyze/analyze.js';
 import { selectSource, openingClosing } from './select/select.js';
 import { mmss } from './select/propose.js';
 import { generateHooks } from './hooks/hooks.js';
-import type { Creator, Shot, FaceSample, Sentence, Candidate } from './types.js';
+import { buildEdl } from './edit/edl.js';
+import { ensureHires, renderClip } from './render/render.js';
+import type { Creator, Shot, FaceSample, Sentence, Candidate, Word, Clip } from './types.js';
 
 // A flag value is a single string/boolean normally, or an array when the same
 // `--flag` was passed more than once on the command line (e.g. repeated `--shorts-url`).
@@ -414,6 +416,97 @@ export const commands: Record<string, { help: string; run: (a: ParsedArgs) => Pr
       for (const s of sheets) {
         console.log(`  t=${s.t.toFixed(1)}s  faces=${s.faces.length}  ${s.jpgPath}`);
       }
+    },
+  },
+  render: {
+    help: 'render <clipId> — render a clip\'s EDL to a mastered MP4 (requires clip.edl already built).',
+    async run(a) {
+      const clipId = a._[0];
+      if (!clipId) {
+        log('usage: cb render <clipId>');
+        process.exitCode = 1;
+        return;
+      }
+      const started = Date.now();
+      await renderClip(clipId);
+      log(`render ${clipId}: done in ${((Date.now() - started) / 1000).toFixed(1)}s`);
+    },
+  },
+  'render-test': {
+    help: 'render-test <sourceId> — build a Clip from the rank-1 shortlisted candidate and render it end-to-end (live smoke test).',
+    async run(a) {
+      const sourceId = a._[0];
+      if (!sourceId) {
+        log('usage: cb render-test <sourceId>');
+        process.exitCode = 1;
+        return;
+      }
+      const dir = paths.source(sourceId);
+      const source = loadSource(sourceId);
+      const creator = loadCreator(source.creator);
+      const candidates = readJson<Candidate[]>(path.join(dir, 'candidates.json'));
+      const candidate = candidates.find((c) => c.shortlisted && c.rank === 1);
+      if (!candidate) {
+        log(`no shortlisted candidate with rank 1 in ${sourceId}`);
+        process.exitCode = 1;
+        return;
+      }
+      const words = readJson<Word[]>(path.join(dir, 'words.json'));
+      const shots = readJson<Shot[]>(path.join(dir, 'shots.json'));
+      const faces = readJson<FaceSample[]>(path.join(dir, 'faces.json'));
+
+      const id = newId('clip');
+      const now = new Date().toISOString();
+      const clip: Clip = {
+        id,
+        sourceId,
+        creator: source.creator,
+        candidateId: candidate.id,
+        start: candidate.start,
+        end: candidate.end,
+        coldOpen: null,
+        title: candidate.title,
+        description: '',
+        hashtags: [],
+        hooks: [{ text: candidate.title, pattern: 'test', score: 0 }],
+        hookIndex: 0,
+        scores: candidate.scores,
+        composite: candidate.composite,
+        rankReason: candidate.rankReason ?? '',
+        patterns: candidate.patterns,
+        hiresOffset: 0,
+        status: 'planned',
+        renders: 0,
+        createdAt: now,
+        updatedAt: now,
+      };
+
+      const doneHires = step(`ensureHires (${id})`);
+      await ensureHires(clip, source);
+      doneHires();
+
+      clip.edl = buildEdl({
+        start: clip.start,
+        end: clip.end,
+        coldOpen: clip.coldOpen,
+        words,
+        shots,
+        faces,
+        srcAspect: source.width / source.height,
+        hiresOffset: clip.hiresOffset,
+        videoSrc: 'hires.mp4',
+        hook: clip.hooks[clip.hookIndex].text,
+        style: 'default',
+        override: creator.layoutOverride,
+      });
+      saveClip(clip);
+
+      log(`render-test ${id}: edl built (${clip.edl.segments.length} segments, ${clip.edl.durationSec.toFixed(1)}s)`);
+      const started = Date.now();
+      await renderClip(id);
+      const elapsed = (Date.now() - started) / 1000;
+      log(`render-test ${id}: rendered in ${elapsed.toFixed(1)}s`);
+      console.log(id);
     },
   },
 };
