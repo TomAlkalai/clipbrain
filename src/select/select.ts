@@ -1,12 +1,13 @@
 import path from 'node:path';
 import fs from 'node:fs';
-import { paths, loadSource, loadCreator, readJson, readJsonOr, writeJson, newId } from '../store.js';
+import { paths, loadSource, loadCreator, readJson, readJsonOr, writeJson } from '../store.js';
 import { loadPlaybook, playbookPromptBlock } from '../playbook/playbook.js';
 import { log, step } from '../log.js';
 import type { Sentence, Word, Candidate } from '../types.js';
-import { windows, snapBounds, composite, dedupe, mergeFragmentedSentences } from './snap.js';
+import { windows, snapBounds, composite, dedupe, mergeFragmentedSentences, candidateId } from './snap.js';
 import { proposeWindow } from './propose.js';
 import { finalRank } from './rank.js';
+import { checkBoundaries, applyBoundaryCheck } from './boundary.js';
 
 const TOP_POOL = 20; // how many deduped candidates (by composite) get sent to the final-rank call
 
@@ -88,7 +89,7 @@ export async function selectSource(sourceId: string, o?: SelectOpts): Promise<Ca
         continue;
       }
       candidates.push({
-        id: newId('cand'),
+        id: candidateId(sourceId, startSid, endSid),
         sourceId,
         startSid,
         endSid,
@@ -109,11 +110,30 @@ export async function selectSource(sourceId: string, o?: SelectOpts): Promise<Ca
   const deduped = dedupe(candidates);
   log(`selectSource ${sourceId}: ${deduped.length} after dedupe`);
 
-  const pool = [...deduped].sort((a, b) => b.composite - a.composite).slice(0, TOP_POOL);
-  const ranking = await finalRank(pool, sentences, creator.name, pbBlock, top);
+  const byComposite = [...deduped].sort((a, b) => b.composite - a.composite);
+  const pool = byComposite.slice(0, TOP_POOL);
+  const rest = byComposite.slice(TOP_POOL);
 
+  // Focused verifier: for the top candidates only, an independent (cheap, fast-tier) LLM call
+  // checks whether the opening truly stands alone and the ending truly lands the payoff —
+  // catching what the proposer itself missed, rather than relying solely on better proposer
+  // prompting. Repairs shift startSid/endSid within a small window when that keeps the clip's
+  // duration in bounds; otherwise the relevant score is penalized so a still-broken clip ranks
+  // lower instead of silently shipping.
+  const boundsForCheck = { minSec, maxSec, weights: pb.weights };
+  const checks = await Promise.all(pool.map((c) => checkBoundaries(c, sentences, { minSec, maxSec })));
+  const checkedPool = pool
+    .map((c, i) => applyBoundaryCheck(c, checks[i], sentences, words, boundsForCheck))
+    .sort((a, b) => b.composite - a.composite);
+  const repairedCount = checkedPool.filter((c) => c.boundary?.repaired).length;
+  const penalizedCount = checkedPool.filter((c) => c.boundary && !c.boundary.repaired && (!c.boundary.openingStandalone || !c.boundary.endingComplete)).length;
+  log(`selectSource ${sourceId}: boundary check repaired ${repairedCount}/${checkedPool.length}, penalized ${penalizedCount}/${checkedPool.length}`);
+
+  const ranking = await finalRank(checkedPool, sentences, creator.name, pbBlock, top);
+
+  const allCandidates = [...checkedPool, ...rest];
   const rankById = new Map(ranking.map((r, i) => [r.id, { rank: i + 1, reason: r.reason }]));
-  for (const c of deduped) {
+  for (const c of allCandidates) {
     const r = rankById.get(c.id);
     if (r) {
       c.rank = r.rank;
@@ -122,7 +142,7 @@ export async function selectSource(sourceId: string, o?: SelectOpts): Promise<Ca
     }
   }
 
-  const sorted = [...deduped].sort((a, b) => {
+  const sorted = [...allCandidates].sort((a, b) => {
     if (a.shortlisted && b.shortlisted) return (a.rank ?? 0) - (b.rank ?? 0);
     if (a.shortlisted) return -1;
     if (b.shortlisted) return 1;

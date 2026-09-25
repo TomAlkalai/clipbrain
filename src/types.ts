@@ -35,6 +35,7 @@ export type Candidate = {
   id: string; sourceId: string; startSid: number; endSid: number; start: number; end: number;
   title: string; summary: string; why: string; patterns: string[]; scores: Scores; composite: number;
   rank?: number; rankReason?: string; shortlisted: boolean;
+  boundary?: { openingStandalone: boolean; endingComplete: boolean; repaired: boolean; notes: string };
 };
 
 export type Hook = { text: string; pattern: string; score: number };

@@ -1,5 +1,18 @@
+import crypto from 'node:crypto';
 import type { Sentence, Word, Scores, SignalName, Candidate } from '../types.js';
 import { SIGNALS } from '../types.js';
+
+/**
+ * Deterministic candidate id: same source + same sentence range always yields the same id,
+ * with no randomness. This matters because finalRank's prompt embeds candidate ids — a random
+ * id would make that LLM call cache-miss on every rerun even when nothing actually changed.
+ * Called again after a boundary repair changes startSid/endSid, which is why the ruling calls
+ * this "computed after repair": the formula itself never changes, only its inputs. Pure.
+ */
+export function candidateId(sourceId: string, startSid: number, endSid: number): string {
+  const hash = crypto.createHash('sha1').update(`${sourceId}:${startSid}:${endSid}`).digest('hex');
+  return `cand_${hash.slice(0, 8)}`;
+}
 
 /**
  * Splits `sentences` into overlapping windows of ~`windowSec` seconds (measured
