@@ -214,6 +214,8 @@
     var durLine = clip.idealDurationSec
       ? ' (ideal ' + clip.idealDurationSec.min + '–' + clip.idealDurationSec.max + 's)'
       : '';
+    // `rank` lives on Candidate, not (yet) on Clip — shown only if a future task copies it over.
+    var rankLine = typeof clip.rank === 'number' ? 'rank ' + clip.rank + ' · ' : '';
 
     return '' +
       '<div class="card" data-clip-id="' + clip.id + '">' +
@@ -229,7 +231,7 @@
             '<button class="small" data-action="save-title" data-clip-id="' + clip.id + '">Save</button>' +
           '</div>' +
           '<div class="meta-row">' +
-            '<span>composite ' + Number(clip.composite).toFixed(2) + durLine + '</span>' +
+            '<span>' + rankLine + 'composite ' + Number(clip.composite).toFixed(2) + durLine + '</span>' +
             '<span>' + mmss(clip.start) + '–' + mmss(clip.end) + ' · ' + esc(clip.sourceTitle || clip.sourceId) + '</span>' +
           '</div>' +
           jobLine +
