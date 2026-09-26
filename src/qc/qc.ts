@@ -11,16 +11,7 @@ import { llmVisionJson } from '../llm/vision.js';
 import { loadClip, saveClip, paths, readJsonOr } from '../store.js';
 import { loadPlaybook } from '../playbook/playbook.js';
 import { rebuildEdl } from '../produce.js';
-import {
-  evaluate,
-  visionChecks,
-  planFix,
-  nextSentenceEnd,
-  nextSentenceStart,
-  type Measures,
-  type VisionCritique,
-  type FixPlan,
-} from './rules.js';
+import { evaluate, visionChecks, planFix, type Measures, type VisionCritique, type FixPlan } from './rules.js';
 import type { Clip, Edl, QcCheck, QcReport, Sentence } from '../types.js';
 
 function nullSink(): string {
@@ -182,7 +173,7 @@ const CONTENT_SYSTEM_PROMPT =
   `List any other concrete content problems (poor pacing, missing context, a non sequitur) in issues — an ` +
   `empty array if there are none. Do not invent issues.`;
 
-async function measureContent(clip: Clip): Promise<Measures['content']> {
+async function measureContent(clip: Clip): Promise<NonNullable<Measures['content']>> {
   const edl = clip.edl!;
   const hook = clip.hooks[clip.hookIndex]?.text ?? null;
   const transcript = edl.captions.flatMap((c) => c.words.map((w) => w.w)).join(' ');
@@ -203,21 +194,41 @@ async function measureContent(clip: Clip): Promise<Measures['content']> {
   };
 }
 
+function errMessage(err: unknown): string {
+  return err instanceof Error ? err.message : String(err);
+}
+
+/**
+ * Wraps `measureContent` so a qc-content LLM failure (after `llmJson`'s own retry) degrades to
+ * `content: null` + an error message instead of crashing the whole `measure()`/`qcClip()` call
+ * (controller ruling, Task 13 fix round 1). Exported for direct testing with a stubbed
+ * `setBackend`.
+ */
+export async function measureContentSafe(clip: Clip): Promise<{ content: Measures['content']; error?: string }> {
+  try {
+    return { content: await measureContent(clip) };
+  } catch (err) {
+    return { content: null, error: errMessage(err) };
+  }
+}
+
 /**
  * Measures a rendered clip's technical, audio, visual and content properties from
  * `data/clips/<id>/render.mp4`, per task-13-brief.md's exact ffmpeg invocations. `evaluate()`
- * (rules.ts) then turns this into pass/fail QcChecks.
+ * (rules.ts) then turns this into pass/fail QcChecks. Only the qc-content LLM call degrades
+ * gracefully (`content`/`contentError`) — every other measurement here still throws hard on
+ * failure, same as before.
  */
 export async function measure(clip: Clip): Promise<Measures> {
   if (!clip.edl) throw new Error(`measure: clip ${clip.id} has no edl`);
   const renderPath = path.join(paths.clip(clip.id), 'render.mp4');
 
-  const [probe, loudness, filters, faceChecks, content] = await Promise.all([
+  const [probe, loudness, filters, faceChecks, contentResult] = await Promise.all([
     probeRenderFile(renderPath),
     measureLoudness(renderPath),
     measureFilters(renderPath),
     measureFaceChecks(clip, renderPath),
-    measureContent(clip),
+    measureContentSafe(clip),
   ]);
 
   return {
@@ -227,7 +238,8 @@ export async function measure(clip: Clip): Promise<Measures> {
     black: filters.black,
     freezes: filters.freezes,
     faceChecks,
-    content,
+    content: contentResult.content,
+    contentError: contentResult.error,
     maxCaptionChars: maxCaptionCharsOf(clip.edl),
   };
 }
@@ -243,7 +255,10 @@ const VISION_QC_SCHEMA = {
     hookReadable: { type: 'boolean' },
     overlaysCoverFace: { type: 'boolean' },
     verdict: { type: 'string', enum: ['keep', 'improve', 'reject'] },
-    improvements: { type: 'array', items: { type: 'string', enum: ['fit_layout', 'next_hook', 'extend_end', 'trim_start'] } },
+    improvements: {
+      type: 'array',
+      items: { type: 'string', enum: ['fit_layout', 'next_hook', 'extend_end', 'trim_start', 'move_hook_up'] },
+    },
     reason: { type: 'string' },
   },
 };
@@ -255,13 +270,15 @@ const VISION_QC_SYSTEM_PROMPT =
   `- framingOk: is the subject well-framed in each still (not cut off, not tiny, not off-center)?\n` +
   `- captionsReadable: are the burned-in captions legible (not clipped, not illegible against the background)?\n` +
   `- hookReadable: is the hook overlay text legible and not covering anything important?\n` +
-  `- overlaysCoverFace: true if any caption/hook overlay covers a speaker's face in any still.\n` +
+  `- overlaysCoverFace: true if the hook or caption overlay covers a speaker's face (eyes/forehead) in any ` +
+  `still — set this whenever that's what you observe, independent of whether you also list move_hook_up below.\n` +
   `Then give an overall verdict: 'keep' (ship as-is), 'improve' (a specific fix would clearly help), or ` +
   `'reject' (fundamentally broken, not worth another fix attempt). If 'improve' or 'reject' and a fix could ` +
   `plausibly help, list which of fit_layout (switch cropped/framed segments to a full-frame fit layout), ` +
-  `next_hook (try the next hook variant), extend_end (extend the clip to finish the cut-off thought) or ` +
-  `trim_start (trim the awkward opening) would help, in priority order (empty array if truly unfixable). ` +
-  `Give a one-sentence reason for the verdict.`;
+  `next_hook (try the next hook variant), extend_end (extend the clip to finish the cut-off thought), ` +
+  `trim_start (trim the awkward opening) or move_hook_up (the hook box is too low and overlaps the subject's ` +
+  `face — move it much higher) would help, in priority order (empty array if truly unfixable). Give a ` +
+  `one-sentence reason for the verdict.`;
 
 async function extractQcStills(renderPath: string, durationSec: number, outDir: string): Promise<string[]> {
   fs.mkdirSync(outDir, { recursive: true });
@@ -285,17 +302,12 @@ async function extractQcStills(renderPath: string, durationSec: number, outDir: 
 }
 
 /**
- * Extracts 4 stills from the rendered clip (0.5s, 25%, 60%, 90%) and asks a vision-capable LLM
- * (tier `balanced`, purpose `qc-vision`) to critique the rendered output — the EXTENSION to
- * task-13-brief.md: QC judges the actual pixels, not just ffmpeg/content-transcript measurements.
+ * The LLM-calling half of the vision critique, separated from still-extraction (`extractQcStills`,
+ * real ffmpeg I/O) so it can be exercised directly — e.g. with a fabricated `images` list and a
+ * stubbed `setVisionBackend` — without needing a real rendered video.
  */
-export async function critiqueRender(clip: Clip): Promise<VisionCritique> {
-  const dir = paths.clip(clip.id);
-  const renderPath = path.join(dir, 'render.mp4');
+export async function callVisionCritique(clip: Clip, images: string[]): Promise<VisionCritique> {
   const edl = clip.edl!;
-  const outDir = path.join(dir, 'qc-stills');
-  const images = await extractQcStills(renderPath, edl.durationSec, outDir);
-
   const hook = clip.hooks[clip.hookIndex]?.text ?? '(none)';
   const transcript = edl.captions.flatMap((c) => c.words.map((w) => w.w)).join(' ');
   const prompt =
@@ -314,14 +326,43 @@ export async function critiqueRender(clip: Clip): Promise<VisionCritique> {
   });
 }
 
+/**
+ * Extracts 4 stills from the rendered clip (0.5s, 25%, 60%, 90%) and asks a vision-capable LLM
+ * (tier `balanced`, purpose `qc-vision`) to critique the rendered output — the EXTENSION to
+ * task-13-brief.md: QC judges the actual pixels, not just ffmpeg/content-transcript measurements.
+ */
+export async function critiqueRender(clip: Clip): Promise<VisionCritique> {
+  const dir = paths.clip(clip.id);
+  const renderPath = path.join(dir, 'render.mp4');
+  const edl = clip.edl!;
+  const outDir = path.join(dir, 'qc-stills');
+  const images = await extractQcStills(renderPath, edl.durationSec, outDir);
+  return callVisionCritique(clip, images);
+}
+
+/**
+ * Wraps `critiqueRender` so a qc-vision failure (still-extraction or the LLM call itself, after
+ * `llmVisionJson`'s own retry) degrades to `vision: null` + an error message instead of crashing
+ * the whole `qcClip()` call (controller ruling, Task 13 fix round 1) — the vision-derived checks
+ * are then simply omitted for that round. Exported for direct testing with a stubbed
+ * `setVisionBackend`.
+ */
+export async function critiqueRenderSafe(clip: Clip): Promise<{ vision: VisionCritique | null; error?: string }> {
+  try {
+    return { vision: await critiqueRender(clip) };
+  } catch (err) {
+    return { vision: null, error: errMessage(err) };
+  }
+}
+
 // ---- Auto-fix application (I/O) ----
 
-async function applyFixPlan(
-  plan: FixPlan,
-  clip: Clip,
-  sentences: Sentence[],
-  bounds: { minSec: number; maxSec: number },
-): Promise<string | null> {
+/**
+ * Applies a `FixPlan` that `planFix` (rules.ts) has already feasibility-checked — `extend_end`/
+ * `trim_start` carry their pre-computed, already-bounds-checked `newEnd`/`newStart`, so this
+ * function has nothing left to validate and no reason to decline.
+ */
+async function applyFixPlan(plan: FixPlan, clip: Clip): Promise<string> {
   const dir = paths.clip(clip.id);
 
   switch (plan.kind) {
@@ -341,29 +382,27 @@ async function applyFixPlan(
       return `advanced hookIndex to ${clip.hookIndex} (${plan.reason})`;
     }
     case 'extend_end': {
-      const newEnd = nextSentenceEnd(sentences, clip.end);
-      if (newEnd === null) return null;
-      const newDuration = newEnd - clip.start;
-      if (newDuration > bounds.maxSec * 1.15) return null;
-      clip.end = newEnd;
+      clip.end = plan.newEnd;
       await rebuildEdl(clip);
       await renderClip(clip.id);
-      return `extended end to ${newEnd.toFixed(2)}s (${plan.reason})`;
+      return `extended end to ${plan.newEnd.toFixed(2)}s (${plan.reason})`;
     }
     case 'trim_start': {
-      const newStart = nextSentenceStart(sentences, clip.start);
-      if (newStart === null || newStart >= clip.end) return null;
-      const newDuration = clip.end - newStart;
-      if (newDuration < bounds.minSec) return null;
-      clip.start = newStart;
+      clip.start = plan.newStart;
       await rebuildEdl(clip);
       await renderClip(clip.id);
-      return `trimmed start to ${newStart.toFixed(2)}s (${plan.reason})`;
+      return `trimmed start to ${plan.newStart.toFixed(2)}s (${plan.reason})`;
     }
     case 'loosen_pauses': {
       await rebuildEdl(clip, { maxPause: 0.3 });
       await renderClip(clip.id);
       return `loosened maxPause to 0.3s (${plan.reason})`;
+    }
+    case 'move_hook_up': {
+      clip.style = 'hook-high';
+      await rebuildEdl(clip);
+      await renderClip(clip.id);
+      return `switched style to hook-high (${plan.reason})`;
     }
   }
 }
@@ -392,9 +431,31 @@ export async function qcClip(clipId: string): Promise<QcReport> {
   let checks: QcCheck[] = [];
 
   for (let round = 0; ; round++) {
-    const measures = await measure(clip);
-    const vision = await critiqueRender(clip);
-    checks = [...evaluate(measures, clip.edl!.durationSec), ...visionChecks(vision)];
+    // measure() (technical/audio/visual/content) and critiqueRenderSafe() (vision) are
+    // independent — run them concurrently. critiqueRenderSafe() never rejects (see below), so
+    // this Promise.all only fails if measure() itself throws (a hard, non-LLM failure).
+    const [measures, visionOutcome] = await Promise.all([measure(clip), critiqueRenderSafe(clip)]);
+    const vision = visionOutcome.vision;
+
+    const degradedChecks: QcCheck[] = [];
+    if (measures.contentError) {
+      degradedChecks.push({
+        name: 'critique_unavailable',
+        ok: false,
+        detail: `qc-content unavailable: ${measures.contentError}`,
+        severity: 'warn',
+      });
+    }
+    if (visionOutcome.error) {
+      degradedChecks.push({
+        name: 'critique_unavailable',
+        ok: false,
+        detail: `qc-vision unavailable: ${visionOutcome.error}`,
+        severity: 'warn',
+      });
+    }
+
+    checks = [...evaluate(measures, clip.edl!.durationSec), ...(vision ? visionChecks(vision) : []), ...degradedChecks];
     const ok = !checks.some((c) => c.severity === 'error' && !c.ok);
 
     if (ok || round >= MAX_FIX_ROUNDS) break;
@@ -404,11 +465,15 @@ export async function qcClip(clipId: string): Promise<QcReport> {
       hookIndex: clip.hookIndex,
       hookCount: clip.hooks.length,
       allNonFitSegments,
+      start: clip.start,
+      end: clip.end,
+      minSec: bounds.minSec,
+      maxSec: bounds.maxSec,
+      sentences,
     });
     if (!plan) break;
 
-    const applied = await applyFixPlan(plan, clip, sentences, bounds);
-    if (!applied) break;
+    const applied = await applyFixPlan(plan, clip);
     fixesApplied.push(applied);
     clip = loadClip(clipId); // pick up whatever renderClip/rebuildEdl/master persisted
   }

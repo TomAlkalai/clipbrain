@@ -9,6 +9,9 @@ export type Measures = {
   faceChecks: { segment: number; ok: boolean }[];
   content: { standalone: boolean; cleanEnding: boolean; hookMatches: boolean; issues: string[] } | null;
   maxCaptionChars: number;
+  /** Set (and `content` left null) when the qc-content LLM call threw — surfaced by qc.ts as a
+   * warn-severity `critique_unavailable` check rather than crashing the whole QC run. */
+  contentError?: string;
 };
 
 function check(name: string, ok: boolean, detail: string, severity: 'error' | 'warn'): QcCheck {
@@ -64,7 +67,10 @@ export function evaluate(m: Measures, expectedDurationSec: number): QcCheck[] {
     ),
   );
 
-  out.push(check('true_peak', m.loudness.tp <= -0.5, `${m.loudness.tp.toFixed(1)} dBTP (want <= -0.5)`, 'error'));
+  // -1.0 dBTP, not the brief's -0.5: shared-context.md's global constraint ("true peak <= -1.0
+  // dBTP") is binding (controller ruling, Task 13 fix round 1) and also matches render.ts's own
+  // DELIVERED_TP_CEILING_DBTP, which this check was previously inconsistent with.
+  out.push(check('true_peak', m.loudness.tp <= -1.0, `${m.loudness.tp.toFixed(1)} dBTP (want <= -1.0)`, 'error'));
 
   const longSilence = m.silences.find((s) => s.end - s.start >= 1.2);
   out.push(
@@ -158,7 +164,7 @@ export function evaluate(m: Measures, expectedDurationSec: number): QcCheck[] {
 
 // ---- Vision critique (EXTENSION) ----
 
-export type VisionImprovement = 'fit_layout' | 'next_hook' | 'extend_end' | 'trim_start';
+export type VisionImprovement = 'fit_layout' | 'next_hook' | 'extend_end' | 'trim_start' | 'move_hook_up';
 export type VisionVerdict = 'keep' | 'improve' | 'reject';
 
 export type VisionCritique = {
@@ -197,9 +203,10 @@ export type FixPlan =
   | { kind: 'remaster'; reason: string }
   | { kind: 'fit_segments'; segments: number[]; reason: string }
   | { kind: 'next_hook'; reason: string }
-  | { kind: 'extend_end'; reason: string }
-  | { kind: 'trim_start'; reason: string }
-  | { kind: 'loosen_pauses'; reason: string };
+  | { kind: 'extend_end'; newEnd: number; reason: string }
+  | { kind: 'trim_start'; newStart: number; reason: string }
+  | { kind: 'loosen_pauses'; reason: string }
+  | { kind: 'move_hook_up'; reason: string };
 
 export type FixCtx = {
   hookIndex: number;
@@ -209,14 +216,48 @@ export type FixCtx = {
    * its own to point at (e.g. framing passed the 60% bar but the vision critic still didn't
    * like it). */
   allNonFitSegments: number[];
+  /** clip.start / clip.end (source seconds) and the creator's duration bounds — needed to check
+   * `extend_end`/`trim_start` feasibility (see `feasibleExtendEnd`/`feasibleTrimStart` below)
+   * before committing to that plan, so an infeasible fix falls through to the next candidate
+   * instead of being returned and later silently declined by the caller. */
+  start: number;
+  end: number;
+  minSec: number;
+  maxSec: number;
+  sentences: Sentence[];
 };
+
+/** The new `end` an `extend_end` fix would use, or null if there's no later sentence, or if
+ * doing so would push the clip's duration past `maxSec * 1.15`. Pure. */
+function feasibleExtendEnd(ctx: FixCtx): number | null {
+  const newEnd = nextSentenceEnd(ctx.sentences, ctx.end);
+  if (newEnd === null) return null;
+  if (newEnd - ctx.start > ctx.maxSec * 1.15) return null;
+  return newEnd;
+}
+
+/** The new `start` a `trim_start` fix would use, or null if there's no later sentence to trim to
+ * (or it would swallow the whole clip), or if doing so would push the clip's duration below
+ * `minSec`. Pure. */
+function feasibleTrimStart(ctx: FixCtx): number | null {
+  const newStart = nextSentenceStart(ctx.sentences, ctx.start);
+  if (newStart === null || newStart >= ctx.end) return null;
+  if (ctx.end - newStart < ctx.minSec) return null;
+  return newStart;
+}
 
 /**
  * Decides the single next auto-fix action for a QC round, given the round's checks/measures and
  * (if run) the vision critique. Rule-based fixes (loudness/true_peak, clean_ending, hook_matches,
  * framing, dead_air) take priority, in the order task-13-brief.md lists them, over vision-driven
  * ones — a vision fix is only considered once none of the rule-based failures have an applicable
- * fix. Returns null when nothing more can be done (QC then finalizes as-is). Pure.
+ * fix. Every candidate fix is feasibility-checked here (not just planned and later declined by
+ * the caller) — an infeasible one (no next sentence to extend/trim to, would blow the duration
+ * bounds, no next hook variant to advance to) falls through to the next candidate in priority
+ * order, rather than the whole round giving up. `vision.overlaysCoverFace` (or an explicit
+ * `move_hook_up` improvement) maps to a style change moving the hook overlay clear of the
+ * speaker's face, ahead of the other vision improvements (Task 13 fix round 1). Returns null only
+ * when nothing left is fixable (QC then finalizes as-is). Pure.
  */
 export function planFix(checks: QcCheck[], measures: Measures, vision: VisionCritique | null, ctx: FixCtx): FixPlan | null {
   const failing = (name: string) => checks.some((c) => c.name === name && !c.ok);
@@ -225,7 +266,8 @@ export function planFix(checks: QcCheck[], measures: Measures, vision: VisionCri
     return { kind: 'remaster', reason: 'loudness/true_peak out of spec' };
   }
   if (failing('clean_ending')) {
-    return { kind: 'extend_end', reason: 'clean_ending failed' };
+    const newEnd = feasibleExtendEnd(ctx);
+    if (newEnd !== null) return { kind: 'extend_end', newEnd, reason: 'clean_ending failed' };
   }
   if (failing('hook_matches') && ctx.hookIndex + 1 < ctx.hookCount) {
     return { kind: 'next_hook', reason: 'hook_matches failed' };
@@ -239,6 +281,9 @@ export function planFix(checks: QcCheck[], measures: Measures, vision: VisionCri
   }
 
   if (vision && vision.verdict !== 'keep') {
+    if (vision.overlaysCoverFace) {
+      return { kind: 'move_hook_up', reason: 'vision: overlays cover face' };
+    }
     for (const improvement of vision.improvements) {
       if (improvement === 'fit_layout') {
         const failingFace = measures.faceChecks.filter((f) => !f.ok).map((f) => f.segment);
@@ -247,9 +292,13 @@ export function planFix(checks: QcCheck[], measures: Measures, vision: VisionCri
       } else if (improvement === 'next_hook') {
         if (ctx.hookIndex + 1 < ctx.hookCount) return { kind: 'next_hook', reason: 'vision: next_hook' };
       } else if (improvement === 'extend_end') {
-        return { kind: 'extend_end', reason: 'vision: extend_end' };
+        const newEnd = feasibleExtendEnd(ctx);
+        if (newEnd !== null) return { kind: 'extend_end', newEnd, reason: 'vision: extend_end' };
       } else if (improvement === 'trim_start') {
-        return { kind: 'trim_start', reason: 'vision: trim_start' };
+        const newStart = feasibleTrimStart(ctx);
+        if (newStart !== null) return { kind: 'trim_start', newStart, reason: 'vision: trim_start' };
+      } else if (improvement === 'move_hook_up') {
+        return { kind: 'move_hook_up', reason: 'vision: move_hook_up' };
       }
     }
   }

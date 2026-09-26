@@ -11,7 +11,7 @@ const FADE_FRAMES = 6;
 
 export const HookOverlay: React.FC<{
   hook: { text: string; start: number; end: number };
-  st: { hookTop: number };
+  st: { hookTop: number; hookFontSize: number };
 }> = ({ hook, st }) => {
   const frame = useCurrentFrame();
   const { fps } = useVideoConfig();
@@ -46,7 +46,7 @@ export const HookOverlay: React.FC<{
           maxWidth: 940,
         }}
       >
-        <div style={{ fontFamily, fontWeight: 800, fontSize: 70, color: '#000', textAlign: 'center', lineHeight: 1.15 }}>
+        <div style={{ fontFamily, fontWeight: 800, fontSize: st.hookFontSize, color: '#000', textAlign: 'center', lineHeight: 1.15 }}>
           {hook.text}
         </div>
       </div>

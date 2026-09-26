@@ -42,7 +42,7 @@ export async function rebuildEdl(clip: Clip, overrides?: { maxPause?: number; fi
     hiresOffset: clip.hiresOffset,
     videoSrc: 'hires.mp4',
     hook,
-    style: 'default',
+    style: clip.style ?? 'default',
     override: creator.layoutOverride,
     ...(overrides?.maxPause !== undefined ? { opts: { maxPause: overrides.maxPause } } : {}),
   });
