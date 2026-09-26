@@ -17,6 +17,7 @@ import { mmss } from './select/propose.js';
 import { generateHooks } from './hooks/hooks.js';
 import { buildEdl } from './edit/edl.js';
 import { ensureHires, renderClip, truncateEdl } from './render/render.js';
+import { qcClip } from './qc/qc.js';
 import { authorize } from './publish/oauth.js';
 import { publish } from './publish/youtube.js';
 import { collectStats, importCsv } from './metrics/stats.js';
@@ -516,6 +517,36 @@ export const commands: Record<string, { help: string; run: (a: ParsedArgs) => Pr
       const elapsed = (Date.now() - started) / 1000;
       log(`render-test ${id}: rendered in ${elapsed.toFixed(1)}s`);
       console.log(id);
+    },
+  },
+  qc: {
+    help: 'qc <clipId> — measure + evaluate a rendered clip (technical/audio/visual/content + vision critique), auto-fixing and re-rendering up to 2 rounds; prints the check table.',
+    async run(a) {
+      const clipId = a._[0];
+      if (!clipId) {
+        log('usage: cb qc <clipId>');
+        process.exitCode = 1;
+        return;
+      }
+      setBackend(claudeBackend);
+      const started = Date.now();
+      const report = await qcClip(clipId);
+      const elapsed = ((Date.now() - started) / 1000).toFixed(1);
+
+      const nameW = Math.max(8, ...report.checks.map((c) => c.name.length));
+      console.log('name'.padEnd(nameW), 'ok'.padEnd(5), 'sev'.padEnd(6), 'detail');
+      for (const c of report.checks) {
+        console.log(c.name.padEnd(nameW), (c.ok ? 'ok' : 'FAIL').padEnd(5), c.severity.padEnd(6), c.detail);
+      }
+
+      if (report.fixesApplied.length > 0) {
+        console.log('\nfixes applied:');
+        for (const f of report.fixesApplied) console.log(`  - ${f}`);
+      } else {
+        console.log('\nfixes applied: none');
+      }
+
+      console.log(`\nverdict: ${report.ok ? 'READY' : 'QC_FAILED'}  (${elapsed}s)`);
     },
   },
   auth: {

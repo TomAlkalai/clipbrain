@@ -1,6 +1,6 @@
 import { it, expect } from 'vitest';
 import { detectShots, frameDiff } from '../src/analyze/shots.js';
-import { nms, letterbox } from '../src/analyze/faces.js';
+import { nms, letterbox, pillarbox } from '../src/analyze/faces.js';
 import { readFrames } from '../src/analyze/frames.js';
 
 it('detects hard cuts and ignores noise', () => {
@@ -21,6 +21,14 @@ it('letterboxes a 320x180 frame into 320x240', () => {
 });
 it('letterbox throws instead of silently cropping a too-tall (portrait) frame', () => {
   expect(() => letterbox(Buffer.alloc(320 * 260 * 3), 320, 260)).toThrow(/exceeds/);
+});
+it('pillarboxes a 180x240 frame into 320x240', () => {
+  const pb = pillarbox(Buffer.alloc(180 * 240 * 3, 255), 180, 240);
+  expect(pb.data.length).toBe(3 * 240 * 320); expect(pb.padLeft).toBe(70); expect(pb.contentW).toBe(180);
+  expect(pb.data[0]).toBeCloseTo(-127 / 128); expect(pb.data[70]).toBeCloseTo(1);
+});
+it('pillarbox throws instead of silently cropping a too-wide (landscape) frame', () => {
+  expect(() => pillarbox(Buffer.alloc(340 * 240 * 3), 340, 240)).toThrow(/exceeds/);
 });
 it('readFrames rejects for a nonexistent file instead of yielding 0 frames silently', async () => {
   const gen = readFrames('this-file-does-not-exist-12345.mp4', { fps: 5, width: 320, height: 180 });
