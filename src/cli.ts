@@ -4,7 +4,7 @@ import { log, step } from './log.js';
 import { llmJson, setBackend, ledgerSummary } from './llm/llm.js';
 import { claudeBackend } from './llm/claude.js';
 import { listChannel, fetchSubs } from './yt/ytdlp.js';
-import { saveCreator, listCreators, paths, readJson, loadSource, loadCreator, newId, saveClip } from './store.js';
+import { saveCreator, listCreators, paths, readJson, loadSource, loadCreator, newId, saveClip, listClips } from './store.js';
 import { mineCreator } from './mine/mine.js';
 import { loadPlaybook, savePlaybook, renderPlaybookMd } from './playbook/playbook.js';
 import { distill } from './playbook/distill.js';
@@ -18,12 +18,14 @@ import { generateHooks } from './hooks/hooks.js';
 import { buildEdl } from './edit/edl.js';
 import { ensureHires, renderClip, truncateEdl } from './render/render.js';
 import { qcClip } from './qc/qc.js';
+import { produceSource, runPipeline, scout } from './produce.js';
+import { evalSource } from './eval.js';
 import { createReviewServer } from './review/server.js';
 import { authorize } from './publish/oauth.js';
 import { publish } from './publish/youtube.js';
 import { collectStats, importCsv } from './metrics/stats.js';
 import { learn } from './learn/learn.js';
-import type { Creator, Shot, FaceSample, Sentence, Candidate, Word, Clip } from './types.js';
+import type { Creator, Shot, FaceSample, Sentence, Candidate, Word, Clip, ClipStatus } from './types.js';
 
 // A flag value is a single string/boolean normally, or an array when the same
 // `--flag` was passed more than once on the command line (e.g. repeated `--shorts-url`).
@@ -548,6 +550,129 @@ export const commands: Record<string, { help: string; run: (a: ParsedArgs) => Pr
       }
 
       console.log(`\nverdict: ${report.ok ? 'READY' : 'QC_FAILED'}  (${elapsed}s)`);
+    },
+  },
+  produce: {
+    help: 'produce <sourceId> [--limit N] — for each shortlisted candidate without a clip yet: hooks→edl→render→qc.',
+    async run(a) {
+      const sourceId = a._[0];
+      if (!sourceId) {
+        log('usage: cb produce <sourceId> [--limit N]');
+        process.exitCode = 1;
+        return;
+      }
+      setBackend(claudeBackend);
+      const limitStr = asString(a.flags.limit);
+      const limit = limitStr !== undefined ? Number(limitStr) : undefined;
+      const started = Date.now();
+      const clips = await produceSource(sourceId, limit !== undefined ? { limit } : undefined);
+      const elapsed = ((Date.now() - started) / 1000).toFixed(1);
+
+      console.log('id'.padEnd(14), 'status'.padEnd(11), 'dur'.padEnd(8), 'composite'.padEnd(10), 'hook');
+      for (const c of clips) {
+        const dur = c.edl ? `${c.edl.durationSec.toFixed(1)}s` : '-';
+        const hook = c.error ? `ERROR: ${c.error}` : (c.hooks[c.hookIndex]?.text ?? '(no hook)');
+        console.log(c.id.padEnd(14), c.status.padEnd(11), dur.padEnd(8), c.composite.toFixed(2).padEnd(10), hook);
+      }
+      log(`produce ${sourceId}: ${clips.length} clip(s) in ${elapsed}s`);
+    },
+  },
+  run: {
+    help: 'run <url|file> --creator <slug> [--top 6] | run --creator <slug> --latest N [--top 6] — full pipeline: ingest→analyze→select→produce (or scout+run per episode).',
+    async run(a) {
+      setBackend(claudeBackend);
+      const creator = asString(a.flags.creator);
+      const top = Number(asString(a.flags.top) ?? 6) || 6;
+      const input = a._[0];
+      const latestStr = asString(a.flags.latest);
+
+      if (!creator) {
+        log('usage: cb run <url|file> --creator <slug> [--top 6]  |  cb run --creator <slug> --latest N [--top 6]');
+        process.exitCode = 1;
+        return;
+      }
+
+      if (input) {
+        await runPipeline(input, creator, { top });
+        return;
+      }
+
+      if (!latestStr) {
+        log('usage: cb run <url|file> --creator <slug> [--top 6]  |  cb run --creator <slug> --latest N [--top 6]');
+        process.exitCode = 1;
+        return;
+      }
+      const latest = Number(latestStr) || 3;
+      const urls = await scout(creator, { latest });
+      if (urls.length === 0) {
+        log(`run ${creator}: scout found no new episodes (>= 900s, not yet ingested)`);
+        return;
+      }
+      log(`run ${creator}: scouted ${urls.length} episode(s), running the pipeline on each sequentially`);
+      for (const url of urls) {
+        await runPipeline(url, creator, { top });
+      }
+    },
+  },
+  eval: {
+    help: "eval <sourceId> — compare mined candidates against the creator's official Shorts from this episode.",
+    async run(a) {
+      const sourceId = a._[0];
+      if (!sourceId) {
+        log('usage: cb eval <sourceId>');
+        process.exitCode = 1;
+        return;
+      }
+      await evalSource(sourceId);
+    },
+  },
+  clips: {
+    help: 'clips [--status s] — list produced clips as a table.',
+    async run(a) {
+      const status = asString(a.flags.status) as ClipStatus | undefined;
+      const clips = listClips(status ? (c) => c.status === status : undefined);
+      if (clips.length === 0) {
+        log(status ? `no clips with status=${status}` : 'no clips yet — run `cb produce <sourceId>` first');
+        return;
+      }
+      console.log(
+        'id'.padEnd(14),
+        'status'.padEnd(11),
+        'source'.padEnd(14),
+        'dur'.padEnd(8),
+        'composite'.padEnd(10),
+        'title',
+      );
+      for (const c of clips) {
+        const dur = c.edl ? `${c.edl.durationSec.toFixed(1)}s` : '-';
+        console.log(
+          c.id.padEnd(14),
+          c.status.padEnd(11),
+          c.sourceId.padEnd(14),
+          dur.padEnd(8),
+          c.composite.toFixed(2).padEnd(10),
+          c.title,
+        );
+      }
+    },
+  },
+  scout: {
+    help: "scout <slug> [--latest 3] [--min-duration 900] — list a creator's newest long-form episodes not yet ingested.",
+    async run(a) {
+      const slug = a._[0];
+      if (!slug) {
+        log('usage: cb scout <slug> [--latest 3] [--min-duration 900]');
+        process.exitCode = 1;
+        return;
+      }
+      const latest = Number(asString(a.flags.latest) ?? 3) || 3;
+      const minDurationSec = Number(asString(a.flags['min-duration']) ?? 900) || 900;
+      const urls = await scout(slug, { latest, minDurationSec });
+      if (urls.length === 0) {
+        log(`scout ${slug}: no new episodes found (>= ${minDurationSec}s, not yet ingested)`);
+        return;
+      }
+      for (const url of urls) console.log(url);
     },
   },
   review: {

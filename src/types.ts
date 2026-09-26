@@ -74,6 +74,11 @@ export type Clip = {
   /** Remotion style name (remotion/style.ts STYLES key); defaults to 'default' when unset.
    * Set by QC's move_hook_up auto-fix ('hook-high') and read by produce.ts's rebuildEdl. */
   style?: string;
+  /** Candidate context copied over by planClip (Task 14) — shown defensively in the review UI. */
+  rank?: number;
+  why?: string;
+  visual?: Candidate['visual'];
+  boundary?: Candidate['boundary'];
   review?: { decision: 'approved' | 'rejected'; reason?: string; at: string };
   publish?: { videoId: string; publishAt?: string; privacy: string; at: string; dryRun: boolean };
   metrics?: { at: string; views: number; engagedViews?: number; avgViewPct?: number; avgViewSec?: number; source: 'analytics' | 'public' | 'csv' }[];
