@@ -189,9 +189,19 @@ export async function produceSource(sourceId: string, o?: { limit?: number }): P
       const message = err instanceof Error ? err.message : String(err);
       log(`produceSource ${sourceId}: candidate ${cand.id} (rank ${cand.rank}) failed: ${message}`);
       if (clip) {
-        clip.error = message;
-        saveClip(clip);
-        results.push(loadClip(clip.id));
+        // Reload from disk rather than reusing the in-memory `clip` object: renderClip/qcClip
+        // load and save their own copy by id, so if either of them ran (and persisted a status
+        // change) before something later in the try block threw, our local reference is stale —
+        // saving it here would silently revert that already-persisted status.
+        let onDisk: Clip;
+        try {
+          onDisk = loadClip(clip.id);
+        } catch {
+          onDisk = clip;
+        }
+        onDisk.error = message;
+        saveClip(onDisk);
+        results.push(onDisk);
       }
     }
   }
