@@ -19,7 +19,7 @@ export const PROPOSE_SCHEMA = {
   properties: {
     candidates: {
       type: 'array',
-      maxItems: 8,
+      maxItems: 10,
       items: {
         type: 'object',
         required: ['startSid', 'endSid', 'title', 'summary', 'why', 'patterns', 'scores'],
@@ -75,7 +75,9 @@ function systemPrompt(ctx: ProposeCtx): string {
     `the next one that passes the check on its own, even if it costs some setup; a confusing open is worse than a shorter clip. A sentence that ` +
     `merely opens with a connective ("so", "and", "but") passes the check fine as long as everything it refers to is resolvable within the clip itself.\n` +
     `- endSid must land the payoff; include the line where the point hits, not the line before it.\n` +
-    `- Return 0–8 candidates. Fewer, better candidates beat many weak ones. Return none if nothing in this window is genuinely strong.\n` +
+    `- Return EVERY moment in this window that could plausibly work as a standalone Short (typically 2–6 per 10 minutes ` +
+    `of conversation). A later ranking stage filters. Scoring must stay honest and calibrated; do not inflate scores to ` +
+    `justify inclusion.\n` +
     `- Score each signal 0–10 with a one-line reason. Calibrate: 5 = an average clip on this channel, 8+ = top 10%, 10 = exceptional. Do not inflate.\n` +
     `- patterns = ids of playbook hook patterns / structures the clip uses.`
   );

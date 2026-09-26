@@ -22,7 +22,7 @@ export function candidateId(sourceId: string, startSid: number, endSid: number):
  * windows overlapping by roughly `overlapSec` seconds so a clip near a window
  * boundary is never missed. Pure.
  */
-export function windows(sentences: Sentence[], windowSec = 1200, overlapSec = 90): { s0: number; s1: number }[] {
+export function windows(sentences: Sentence[], windowSec = 600, overlapSec = 60): { s0: number; s1: number }[] {
   const n = sentences.length;
   if (n === 0) return [];
   const step = windowSec - overlapSec;

@@ -3,16 +3,17 @@ import fs from 'node:fs';
 import { paths, loadSource, loadCreator, readJson, readJsonOr, writeJson } from '../store.js';
 import { loadPlaybook, playbookPromptBlock } from '../playbook/playbook.js';
 import { log, step } from '../log.js';
-import type { Sentence, Word, Candidate, Shot, FaceSample } from '../types.js';
+import type { Sentence, Word, Candidate, Shot, FaceSample, ShortFeatures } from '../types.js';
 import { windows, snapBounds, composite, dedupe, mergeFragmentedSentences, candidateId } from './snap.js';
 import { proposeWindow } from './propose.js';
-import { finalRank } from './rank.js';
+import { finalRank, topAudienceExamples } from './rank.js';
 import { checkBoundaries, applyBoundaryCheck } from './boundary.js';
 import { visualMetrics, visualScore, visionCheck } from './visual.js';
 
-const TOP_POOL = 20; // how many deduped candidates (by composite) get sent to the final-rank call
+const TOP_POOL = 25; // how many deduped candidates (by composite) get sent to the final-rank call
+const AUDIENCE_EXAMPLES_N = 10; // how many of the creator's own top-performing official Shorts feed the final-rank prompt
 
-export type SelectOpts = { top?: number; force?: boolean };
+export type SelectOpts = { top?: number; force?: boolean; windowSec?: number; overlapSec?: number };
 
 function candidatesPath(sourceId: string): string {
   return path.join(paths.source(sourceId), 'candidates.json');
@@ -62,7 +63,7 @@ export async function selectSource(sourceId: string, o?: SelectOpts): Promise<Ca
   const pbBlock = playbookPromptBlock(pb);
   const { min: minSec, max: maxSec } = pb.idealDurationSec;
 
-  const ws = windows(sentences);
+  const ws = windows(sentences, o?.windowSec, o?.overlapSec);
   const propCtx = { creatorName: creator.name, title: source.title, pbBlock, minSec, maxSec };
 
   const done = step(`selectSource ${sourceId}: proposing over ${ws.length} window(s)`);
@@ -172,7 +173,12 @@ export async function selectSource(sourceId: string, o?: SelectOpts): Promise<Ca
   );
   doneVisual();
 
-  const ranking = await finalRank(finalPool, sentences, creator.name, pbBlock, top);
+  // Audience calibration: the creator's own top-performing official Shorts, so the final-rank
+  // call can weigh audience fit against real examples instead of guessing at channel taste.
+  const features = readJsonOr<ShortFeatures[]>(path.join(paths.creator(source.creator), 'features.json'), []);
+  const audienceExamples = topAudienceExamples(features, AUDIENCE_EXAMPLES_N);
+
+  const ranking = await finalRank(finalPool, sentences, creator.name, pbBlock, top, audienceExamples);
 
   const rankById = new Map(ranking.map((r, i) => [r.id, { rank: i + 1, reason: r.reason }]));
   for (const c of dedupedAfterCheck) {

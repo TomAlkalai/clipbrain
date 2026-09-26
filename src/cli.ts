@@ -312,17 +312,25 @@ export const commands: Record<string, { help: string; run: (a: ParsedArgs) => Pr
     },
   },
   select: {
-    help: 'select <sourceId> [--top 6] [--force] [--text] — propose, snap, dedupe and rank clip candidates.',
+    help:
+      'select <sourceId> [--top 6] [--force] [--text] [--window-sec 600] [--overlap-sec 60] — propose, snap, dedupe and rank clip candidates.',
     async run(a) {
       const sourceId = a._[0];
       if (!sourceId) {
-        log('usage: cb select <sourceId> [--top 6] [--force] [--text]');
+        log('usage: cb select <sourceId> [--top 6] [--force] [--text] [--window-sec 600] [--overlap-sec 60]');
         process.exitCode = 1;
         return;
       }
       setBackend(claudeBackend);
       const top = Number(asString(a.flags.top) ?? 6) || 6;
-      const candidates = await selectSource(sourceId, { top, force: Boolean(a.flags.force) });
+      const windowSecStr = asString(a.flags['window-sec']);
+      const overlapSecStr = asString(a.flags['overlap-sec']);
+      const candidates = await selectSource(sourceId, {
+        top,
+        force: Boolean(a.flags.force),
+        windowSec: windowSecStr ? Number(windowSecStr) : undefined,
+        overlapSec: overlapSecStr ? Number(overlapSecStr) : undefined,
+      });
       const shortlisted = candidates.filter((c) => c.shortlisted).sort((x, y) => (x.rank ?? 0) - (y.rank ?? 0));
 
       console.log('rank  start–end          dur   composite  title');
