@@ -174,6 +174,14 @@ it('POST /api/clips/:id/approve with override:true and no note uses the default 
   expect(onDisk.review?.reason).toBe('override: qc_failed approved by reviewer');
 });
 
+it('POST /api/clips/:id/approve with override:true and an explicit empty-string note does NOT fall back to the default (R4: note ?? default)', async () => {
+  saveClip(makeClip({ id: 'clip_qcf4', status: 'qc_failed' }));
+  const r = await postJson('/api/clips/clip_qcf4/approve', { override: true, note: '' });
+  expect(r.status).toBe(200);
+  const onDisk = loadClip('clip_qcf4');
+  expect(onDisk.review?.reason).toBe('override: ');
+});
+
 it('POST /api/clips/:id/reject without a reason is a 400 and does not change status', async () => {
   saveClip(makeClip({ id: 'clip_reject1', status: 'ready' }));
   const r = await postJson('/api/clips/clip_reject1/reject', {});
@@ -225,7 +233,7 @@ it('POST /api/clips/:id/hook with an out-of-range index is a 400', async () => {
   expect(r.status).toBe(400);
 });
 
-it('a job runner error is reflected as job status error with a message', async () => {
+it('a job runner error is reflected as job status error with a message, and persisted onto clip.error on disk', async () => {
   saveClip(makeClip({ id: 'clip_hook3', hookIndex: 0 }));
   setJobRunner(async () => {
     throw new Error('boom');
@@ -238,6 +246,36 @@ it('a job runner error is reflected as job status error with a message', async (
   const job = jobs.find((j) => j.id === body.jobId);
   expect(job.status).toBe('error');
   expect(job.error).toMatch(/boom/);
+
+  const onDisk = loadClip('clip_hook3');
+  expect(onDisk.error).toMatch(/boom/);
+});
+
+it('a subsequent successful rerender job clears a previously-persisted clip.error', async () => {
+  saveClip(makeClip({ id: 'clip_hook4', hookIndex: 0, error: 'stale error from a prior failed job' }));
+
+  setJobRunner(async () => {
+    /* succeeds */
+  });
+  const r = await postJson('/api/clips/clip_hook4/hook', { index: 1 });
+  expect(r.status).toBe(200);
+  await new Promise((resolve) => setTimeout(resolve, 50));
+
+  const onDisk = loadClip('clip_hook4');
+  expect(onDisk.error).toBeUndefined();
+});
+
+it('a request body over 1MB is rejected with 413 (and does not touch the clip)', async () => {
+  saveClip(makeClip({ id: 'clip_bigbody1', title: 'untouched title' }));
+  const hugeTitle = 'x'.repeat(1024 * 1024 + 100); // > 1MB once JSON-serialized
+  const r = await fetch(`${server.url}/api/clips/clip_bigbody1/title`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ title: hugeTitle }),
+  });
+  expect(r.status).toBe(413);
+  const onDisk = loadClip('clip_bigbody1');
+  expect(onDisk.title).toBe('untouched title');
 });
 
 it('POST /api/clips/:id/title updates the title', async () => {

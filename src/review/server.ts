@@ -43,6 +43,25 @@ const jobs: Job[] = [];
 const queue: string[] = [];
 let draining = false;
 
+// Reloads the clip fresh from disk and persists `clip.error` (set on job failure, cleared on job
+// success) without disturbing whatever fields the job itself already wrote (qc, status, edl, ...).
+// Swallows a missing/unreadable clip — the job's own status/error on `/api/jobs` still surfaces
+// the failure either way, this is just the "show it on the card" persistence the UI reads.
+function persistClipError(clipId: string, message: string | undefined): void {
+  try {
+    const clip = loadClip(clipId);
+    if (message === undefined) {
+      if (clip.error === undefined) return; // nothing to clear
+      delete clip.error;
+    } else {
+      clip.error = message;
+    }
+    saveClip(clip);
+  } catch {
+    /* clip missing/unreadable — ignore */
+  }
+}
+
 async function drainQueue(): Promise<void> {
   if (draining) return;
   draining = true;
@@ -55,9 +74,12 @@ async function drainQueue(): Promise<void> {
       try {
         await jobRunner(job.clipId);
         job.status = 'done';
+        persistClipError(job.clipId, undefined);
       } catch (err) {
+        const message = err instanceof Error ? err.message : String(err);
         job.status = 'error';
-        job.error = err instanceof Error ? err.message : String(err);
+        job.error = message;
+        persistClipError(job.clipId, message);
       }
     }
   } finally {
@@ -122,13 +144,35 @@ function sendJson(res: http.ServerResponse, status: number, body: unknown): void
   res.end(text);
 }
 
+const MAX_BODY_BYTES = 1024 * 1024; // 1 MB
+
+// Distinguishes "body too large" (413) from "body isn't valid JSON" (400) for callers of
+// `readBody`. Rejected as soon as the running byte count crosses the cap, so we stop buffering
+// into `data` at that point (bounding memory) — but the request stream itself is deliberately
+// *not* destroyed here: doing so races the client's still-in-flight upload and tends to surface
+// as a raw socket-reset/`fetch failed` on their end instead of the 413 response we want them to
+// see. Left flowing, the remaining bytes are simply drained and ignored, `end` fires normally,
+// and the 413 gets written and flushed like any other response.
+export class PayloadTooLargeError extends Error {}
+
 function readBody(req: http.IncomingMessage): Promise<any> {
   return new Promise((resolve, reject) => {
     let data = '';
-    req.on('data', (chunk) => {
+    let bytes = 0;
+    let settled = false;
+    req.on('data', (chunk: Buffer) => {
+      bytes += chunk.length;
+      if (settled) return;
+      if (bytes > MAX_BODY_BYTES) {
+        settled = true;
+        reject(new PayloadTooLargeError(`request body exceeds ${MAX_BODY_BYTES} byte limit`));
+        return;
+      }
       data += chunk;
     });
     req.on('end', () => {
+      if (settled) return;
+      settled = true;
       if (!data.trim()) {
         resolve({});
         return;
@@ -139,7 +183,11 @@ function readBody(req: http.IncomingMessage): Promise<any> {
         reject(new Error('invalid JSON body'));
       }
     });
-    req.on('error', reject);
+    req.on('error', (err) => {
+      if (settled) return;
+      settled = true;
+      reject(err);
+    });
   });
 }
 
@@ -194,8 +242,11 @@ function approveClip(id: string, body: any): Result {
 
   const at = new Date().toISOString();
   if (overriding) {
-    const note = typeof body?.note === 'string' && body.note.trim() ? body.note.trim() : 'qc_failed approved by reviewer';
-    clip.review = { decision: 'approved', reason: `override: ${note}`, at };
+    // R4: `note ?? default` — an explicit empty-string note is a deliberate choice by the
+    // reviewer and must NOT be swapped for the default message; only a missing/non-string note
+    // (the key omitted entirely, or the wrong type) falls back to it.
+    const note = typeof body?.note === 'string' ? body.note : undefined;
+    clip.review = { decision: 'approved', reason: `override: ${note ?? 'qc_failed approved by reviewer'}`, at };
   } else {
     const note = typeof body?.note === 'string' && body.note.trim() ? body.note.trim() : undefined;
     clip.review = { decision: 'approved', ...(note ? { reason: note } : {}), at };
@@ -323,8 +374,12 @@ async function handleRequest(req: http.IncomingMessage, res: http.ServerResponse
       let body: any;
       try {
         body = await readBody(req);
-      } catch {
-        sendJson(res, 400, { error: 'invalid JSON body' });
+      } catch (err) {
+        if (err instanceof PayloadTooLargeError) {
+          sendJson(res, 413, { error: err.message });
+        } else {
+          sendJson(res, 400, { error: 'invalid JSON body' });
+        }
         return;
       }
       let r: Result;
