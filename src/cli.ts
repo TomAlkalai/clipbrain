@@ -17,6 +17,10 @@ import { mmss } from './select/propose.js';
 import { generateHooks } from './hooks/hooks.js';
 import { buildEdl } from './edit/edl.js';
 import { ensureHires, renderClip } from './render/render.js';
+import { authorize } from './publish/oauth.js';
+import { publish } from './publish/youtube.js';
+import { collectStats, importCsv } from './metrics/stats.js';
+import { learn } from './learn/learn.js';
 import type { Creator, Shot, FaceSample, Sentence, Candidate, Word, Clip } from './types.js';
 
 // A flag value is a single string/boolean normally, or an array when the same
@@ -507,6 +511,63 @@ export const commands: Record<string, { help: string; run: (a: ParsedArgs) => Pr
       const elapsed = (Date.now() - started) / 1000;
       log(`render-test ${id}: rendered in ${elapsed.toFixed(1)}s`);
       console.log(id);
+    },
+  },
+  auth: {
+    help: 'auth youtube — run the Google OAuth installed-app flow and save .secrets/youtube-token.json.',
+    async run(a) {
+      const sub = a._[0];
+      if (sub !== 'youtube') {
+        log('usage: cb auth youtube');
+        process.exitCode = 1;
+        return;
+      }
+      await authorize();
+    },
+  },
+  publish: {
+    help: 'publish [--live] [--clip <id>] — upload approved, QC-passed clips to YouTube (dry-run unless --live).',
+    async run(a) {
+      const live = Boolean(a.flags.live);
+      const clipId = asString(a.flags.clip);
+      await publish({ live, clipId });
+    },
+  },
+  stats: {
+    help: 'stats | stats import <csv> — collect YouTube view/analytics metrics for published clips.',
+    async run(a) {
+      const sub = a._[0];
+      if (sub === 'import') {
+        const csvPath = a._[1];
+        if (!csvPath) {
+          log('usage: cb stats import <csv>');
+          process.exitCode = 1;
+          return;
+        }
+        const n = await importCsv(csvPath);
+        log(`stats import: updated ${n} clip(s) from ${csvPath}`);
+        return;
+      }
+      const n = await collectStats();
+      log(`stats: updated ${n} clip(s)`);
+    },
+  },
+  learn: {
+    help: 'learn <slug> — combine published outcomes + review labels into the creator\'s playbook (signal weights + findings).',
+    async run(a) {
+      const slug = a._[0];
+      if (!slug) {
+        log('usage: cb learn <slug>');
+        process.exitCode = 1;
+        return;
+      }
+      const or = await learn(slug);
+      log(`learn ${slug}: nPublished=${or.nPublished} nReviewed=${or.nReviewed}`);
+      if (or.findings.length === 0) {
+        log('no findings yet');
+      } else {
+        for (const f of or.findings) console.log(`  - ${f}`);
+      }
     },
   },
 };
