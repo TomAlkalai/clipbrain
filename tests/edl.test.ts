@@ -101,3 +101,126 @@ it('with no silences given, behaves exactly as before (word-gap-only tightening 
   expect(withEmptySilences.durationSec).toBeCloseTo(withoutSilencesField.durationSec, 6);
   expect(withEmptySilences.segments).toEqual(withoutSilencesField.segments);
 });
+
+// ---- Fix round 1 (coordinator review, 2026-09-26) ----
+
+// item 1: a re-timed orphan word's window must never run past the next REAL word in the same
+// piece — previously it used a fixed 0.25s window regardless of where the next real word started.
+it('bounds a re-timed orphan word to end at-or-before the next real word in the same piece, even when they land on the same caption page', () => {
+  const words = [
+    { w: 'hello', start: 0.0, end: 0.5 },
+    { w: 'swallowed', start: 2.10, end: 2.50 }, // entirely inside the cut -> orphan, re-timed
+    { w: 'resumed', start: 2.55, end: 3.00 }, // real word, right after the orphan in the same piece
+  ];
+  const e = buildEdl({
+    words,
+    shots: [{ start: 0, end: 10 }],
+    faces: [{ t: 1, faces: [] }],
+    srcAspect: A, hiresOffset: 0, videoSrc: 'x.mp4', hook: null, style: 'default',
+    start: 0, end: 10, coldOpen: null,
+    silences: [{ start: 2.0, end: 2.6 }],
+  });
+
+  const allWords = e.captions.flatMap((c) => c.words);
+  const find = (w: string) => allWords.find((x) => x.w === w)!;
+  const swallowed = find('swallowed');
+  const resumed = find('resumed');
+
+  // every word has positive duration, and the orphan never overlaps the real word after it
+  expect(swallowed.end).toBeGreaterThan(swallowed.start);
+  expect(resumed.end).toBeGreaterThan(resumed.start);
+  expect(swallowed.end).toBeLessThanOrEqual(resumed.start);
+  expect(swallowed.start).toBeCloseTo(0.575, 3);
+  expect(swallowed.end).toBeCloseTo(0.6, 3);
+  expect(resumed.start).toBeCloseTo(0.6, 3);
+  expect(resumed.end).toBeCloseTo(1.05, 3);
+
+  // they really do land on the same caption page
+  const page = e.captions.find((c) => c.words.some((w) => w.w === 'swallowed'));
+  expect(page?.words.map((w) => w.w)).toEqual(['swallowed', 'resumed']);
+
+  // global invariant: no two words in the whole EDL overlap in output time
+  const sorted = [...allWords].sort((a, b) => a.start - b.start);
+  for (let k = 1; k < sorted.length; k++) {
+    expect(sorted[k].start).toBeGreaterThanOrEqual(sorted[k - 1].end);
+  }
+});
+
+// item 3: a cut right at a range boundary (or two cuts close together) can leave a sub-minSeg
+// piece with no sibling of its own run to merge into — it must still be cleaned up, and cleaning
+// it up must never bridge a real (kept) pause gap back together (which would silently reintroduce
+// dead air — the opposite of this whole fix).
+const minimalBase = {
+  shots: [{ start: 0, end: 30 }],
+  faces: [{ t: 1, faces: [] }],
+  srcAspect: A, hiresOffset: 0, videoSrc: 'x.mp4', hook: null, style: 'default',
+};
+
+it('drops a sub-0.15s sliver left by a silence starting exactly at range.start', () => {
+  const e = buildEdl({
+    ...minimalBase,
+    words: [{ w: 'ok', start: 1.95, end: 2.3 }, { w: 'next', start: 2.31, end: 2.6 }],
+    start: 0, end: 10, coldOpen: null,
+    silences: [{ start: 0, end: 2.0 }],
+  });
+  expect(e.segments.length).toBe(1);
+  expect(e.segments[0].srcStart).toBeCloseTo(1.925, 3);
+  expect(e.segments[0].srcEnd).toBeCloseTo(10, 3);
+  expect(e.durationSec).toBeCloseTo(8.075, 3); // NOT 8.15 — the 0.075s sliver was dropped, not kept
+});
+
+it('drops a sub-0.15s sliver left by a silence ending exactly at range.end', () => {
+  const e = buildEdl({
+    ...minimalBase,
+    words: [{ w: 'start', start: 0.5, end: 1.0 }, { w: 'more', start: 1.01, end: 1.3 }],
+    start: 0, end: 10, coldOpen: null,
+    silences: [{ start: 8.0, end: 10.0 }],
+  });
+  expect(e.segments.length).toBe(1);
+  expect(e.segments[0].srcStart).toBeCloseTo(0, 3);
+  expect(e.segments[0].srcEnd).toBeCloseTo(8.075, 3);
+  expect(e.durationSec).toBeCloseTo(8.075, 3);
+});
+
+it('drops the same kind of sliver in the cold-open range (scoped per-range, main range unaffected)', () => {
+  const e = buildEdl({
+    ...minimalBase,
+    words: [
+      { w: 'flash', start: 21.95, end: 22.3 },
+      { w: 'main1', start: 0.5, end: 1.0 },
+      { w: 'main2', start: 1.01, end: 1.3 },
+    ],
+    start: 0, end: 5, coldOpen: { start: 20, end: 23 },
+    silences: [{ start: 20, end: 22 }],
+  });
+  // cold open plays first: its own tiny sliver at [20, 20.075] is dropped, leaving just [21.925,23]
+  expect(e.segments.length).toBe(2);
+  expect(e.segments[0].srcStart).toBeCloseTo(21.925, 3);
+  expect(e.segments[0].srcEnd).toBeCloseTo(23, 3);
+  expect(e.segments[1].srcStart).toBeCloseTo(0, 3);
+  expect(e.segments[1].srcEnd).toBeCloseTo(5, 3);
+  expect(e.durationSec).toBeCloseTo(1.075 + 5, 3);
+});
+
+it('an isolated short run boxed in by two real pause cuts is dropped, never bridged back into a neighbour (would reintroduce dead air)', () => {
+  // Two word-gap cuts leave a 0.45s middle run (below the 0.5s default minSeg) with a real,
+  // deliberately-kept pause gap on BOTH sides — merging it into either neighbour would extend a
+  // segment's srcStart/srcEnd across one of those gaps, silently re-including the cut dead air.
+  const e = buildEdl({
+    ...minimalBase,
+    words: [
+      { w: 'w1', start: 0.0, end: 2.0 },
+      { w: 'w2', start: 3.0, end: 3.3 }, // the short, isolated middle run
+      { w: 'w3', start: 4.3, end: 19.9 },
+    ],
+    start: 0, end: 20, coldOpen: null,
+    silences: [],
+  });
+  expect(e.segments.length).toBe(2);
+  expect(e.segments[0].srcStart).toBeCloseTo(0, 3);
+  expect(e.segments[0].srcEnd).toBeCloseTo(2.075, 3);
+  expect(e.segments[1].srcStart).toBeCloseTo(4.225, 3);
+  expect(e.segments[1].srcEnd).toBeCloseTo(20, 3);
+  // neither segment spans across either of the two real gaps ([2.075,2.925] or [3.375,4.225])
+  expect(e.durationSec).toBeCloseTo(2.075 + 15.775, 3);
+});

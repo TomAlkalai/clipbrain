@@ -198,6 +198,14 @@ function errMessage(err: unknown): string {
   return err instanceof Error ? err.message : String(err);
 }
 
+/** Per controller ruling R2, `raw.mp4` is deleted once QC finishes, pass or fail — `renderClip`
+ * itself keeps it (needed by the loudness/true_peak remaster fix, which reruns `master()` directly
+ * from it without a full re-render). */
+function cleanupRawMp4(clipId: string): void {
+  const rawPath = path.join(paths.clip(clipId), 'raw.mp4');
+  if (fs.existsSync(rawPath)) fs.rmSync(rawPath);
+}
+
 /**
  * Wraps `measureContent` so a qc-content LLM failure (after `llmJson`'s own retry) degrades to
  * `content: null` + an error message instead of crashing the whole `measure()`/`qcClip()` call
@@ -357,6 +365,14 @@ export async function critiqueRenderSafe(clip: Clip): Promise<{ vision: VisionCr
 
 // ---- Auto-fix application (I/O) ----
 
+/** Injectable seam for `applyFixPlan`'s I/O, so a test can exercise the rollback-on-failure path
+ * with a fake failing render/master instead of doing a real ~12-16 min render. Defaults to the
+ * real implementations. */
+export type ApplyFixDeps = { rebuildEdl: typeof rebuildEdl; renderClip: typeof renderClip; master: typeof master };
+const defaultApplyFixDeps: ApplyFixDeps = { rebuildEdl, renderClip, master };
+
+export type FixBatchResult = { ok: true; descriptions: string[] } | { ok: false; error: string };
+
 /**
  * Applies a whole round's batch of `FixPlan`s that `planFix` (rules.ts) has already
  * feasibility-and-compatibility-checked (at most one boundary change, at most one hook change,
@@ -364,34 +380,50 @@ export async function critiqueRenderSafe(clip: Clip): Promise<{ vision: VisionCr
  * pre-computed, already-bounds-checked `newEnd`/`newStart`, so this function has nothing left to
  * validate and no reason to decline any of them.
  *
- * All the clip-mutating fixes (everything except a standalone `remaster`) are applied to `clip`
- * first, then rebuilt/re-rendered with exactly ONE `rebuildEdl` + ONE `renderClip` call for the
- * whole batch (QC-loop efficiency fix, 2026-09-26 — previously every fix cost its own ~12-16 min
- * re-render). A `remaster` fix needs no re-render of its own: when it's the ONLY fix this round,
- * `master()` re-masters `raw.mp4` directly (as before); when it accompanies a re-render-needing
- * fix, it's folded into that one re-render for free (renderClip's own last step re-masters the
- * fresh output anyway), so `master()` is never called twice.
+ * All the clip-mutating fixes (everything except a standalone `remaster`) are applied to an
+ * in-memory WORKING COPY of `clip` (fix round 1, 2026-09-26 — `clip` itself, the caller's snapshot
+ * of what's currently on disk, is never mutated), then rebuilt/re-rendered with exactly ONE
+ * `rebuildEdl` + ONE `renderClip` call for the whole batch (QC-loop efficiency fix, 2026-09-26 —
+ * previously every fix cost its own ~12-16 min re-render). `rebuildEdl` itself persists the
+ * working copy (new EDL + qcFixHistory + style/hookIndex/start/end) as its own last step, before
+ * `renderClip` ever runs — if `renderClip` (or `rebuildEdl`) then throws, the on-disk clip would be
+ * left claiming a fix history / EDL that the actual `render.mp4` doesn't match. To prevent that,
+ * a failure here restores the on-disk clip back to the untouched `clip` snapshot (plus
+ * `error: message`) and returns `{ ok: false, error }` instead of letting the exception propagate
+ * uncaught — `qcClip` (below) turns that into a clean `qc_failed` with a reason.
+ *
+ * A `remaster` fix needs no re-render of its own: when it's the ONLY fix this round, `master()`
+ * re-masters `raw.mp4` directly (as before, same rollback-on-failure treatment); when it
+ * accompanies a re-render-needing fix, it's folded into that one re-render for free (renderClip's
+ * own last step re-masters the fresh output anyway), so `master()` is never called twice.
  *
  * `clip.qcFixHistory` is extended with every applied fix's `kind` (deduped isn't needed — planFix
  * only ever proposes `loosen_pauses` once it isn't already present) so a later QC round/run can
  * skip a fix that's already a proven no-op.
  */
-async function applyFixPlan(plans: FixPlan[], clip: Clip): Promise<string[]> {
+export async function applyFixPlan(plans: FixPlan[], clip: Clip, deps: ApplyFixDeps = defaultApplyFixDeps): Promise<FixBatchResult> {
   const dir = paths.clip(clip.id);
   const remasterPlan = plans.find((p) => p.kind === 'remaster');
   const rest = plans.filter((p): p is Exclude<FixPlan, { kind: 'remaster' }> => p.kind !== 'remaster');
 
   if (rest.length === 0) {
-    if (!remasterPlan) return [];
-    await master(path.join(dir, 'raw.mp4'), path.join(dir, 'render.mp4'));
-    clip.qcFixHistory = [...(clip.qcFixHistory ?? []), 'remaster'];
-    saveClip(clip);
-    return [`remastered audio (${remasterPlan.reason})`];
+    if (!remasterPlan) return { ok: true, descriptions: [] };
+    try {
+      await deps.master(path.join(dir, 'raw.mp4'), path.join(dir, 'render.mp4'));
+    } catch (err) {
+      const message = errMessage(err);
+      saveClip({ ...clip, error: message });
+      return { ok: false, error: message };
+    }
+    const updated: Clip = { ...clip, qcFixHistory: [...(clip.qcFixHistory ?? []), 'remaster'] };
+    saveClip(updated);
+    return { ok: true, descriptions: [`remastered audio (${remasterPlan.reason})`] };
   }
 
   const descriptions: string[] = [];
   let maxPauseOverride: number | undefined;
   let fitSegmentsOverride: number[] | undefined;
+  const working: Clip = { ...clip };
 
   for (const plan of rest) {
     switch (plan.kind) {
@@ -400,15 +432,15 @@ async function applyFixPlan(plans: FixPlan[], clip: Clip): Promise<string[]> {
         descriptions.push(`set segment(s) [${plan.segments.join(', ')}] to fit layout (${plan.reason})`);
         break;
       case 'next_hook':
-        clip.hookIndex += 1;
-        descriptions.push(`advanced hookIndex to ${clip.hookIndex} (${plan.reason})`);
+        working.hookIndex += 1;
+        descriptions.push(`advanced hookIndex to ${working.hookIndex} (${plan.reason})`);
         break;
       case 'extend_end':
-        clip.end = plan.newEnd;
+        working.end = plan.newEnd;
         descriptions.push(`extended end to ${plan.newEnd.toFixed(2)}s (${plan.reason})`);
         break;
       case 'trim_start':
-        clip.start = plan.newStart;
+        working.start = plan.newStart;
         descriptions.push(`trimmed start to ${plan.newStart.toFixed(2)}s (${plan.reason})`);
         break;
       case 'loosen_pauses':
@@ -416,7 +448,7 @@ async function applyFixPlan(plans: FixPlan[], clip: Clip): Promise<string[]> {
         descriptions.push(`loosened maxPause to 0.3s (${plan.reason})`);
         break;
       case 'move_hook_up':
-        clip.style = 'hook-high';
+        working.style = 'hook-high';
         descriptions.push(`switched style to hook-high (${plan.reason})`);
         break;
     }
@@ -424,16 +456,24 @@ async function applyFixPlan(plans: FixPlan[], clip: Clip): Promise<string[]> {
   if (remasterPlan) {
     descriptions.push(`remastered audio via the same re-render (${remasterPlan.reason})`);
   }
+  working.qcFixHistory = [...(clip.qcFixHistory ?? []), ...plans.map((p) => p.kind)];
 
-  clip.qcFixHistory = [...(clip.qcFixHistory ?? []), ...plans.map((p) => p.kind)];
+  try {
+    await deps.rebuildEdl(working, {
+      ...(maxPauseOverride !== undefined ? { maxPause: maxPauseOverride } : {}),
+      ...(fitSegmentsOverride ? { fitSegments: fitSegmentsOverride } : {}),
+    });
+    await deps.renderClip(working.id);
+  } catch (err) {
+    const message = errMessage(err);
+    // `rebuildEdl` (if it got that far) already persisted `working`'s new EDL/qcFixHistory/etc —
+    // restore the clip to its state from BEFORE this round (the untouched `clip` snapshot) so a
+    // stale/failed render is never left sitting behind a fix history that claims otherwise.
+    saveClip({ ...clip, error: message });
+    return { ok: false, error: message };
+  }
 
-  await rebuildEdl(clip, {
-    ...(maxPauseOverride !== undefined ? { maxPause: maxPauseOverride } : {}),
-    ...(fitSegmentsOverride ? { fitSegments: fitSegmentsOverride } : {}),
-  });
-  await renderClip(clip.id);
-
-  return descriptions;
+  return { ok: true, descriptions };
 }
 
 const MAX_FIX_ROUNDS = 2;
@@ -505,8 +545,20 @@ export async function qcClip(clipId: string): Promise<QcReport> {
     if (plans.length === 0) break;
 
     const applied = await applyFixPlan(plans, clip);
-    if (applied.length === 0) break; // every planned fix turned out to be a no-op (shouldn't normally happen)
-    fixesApplied.push(...applied);
+    if (!applied.ok) {
+      // applyFixPlan already restored clip.json to its pre-round state + `error` on disk — load
+      // that back, attach this round's (failing) checks as the reason, and finalize as qc_failed
+      // rather than letting the render/rebuild failure propagate as an uncaught exception.
+      const failedClip = loadClip(clipId);
+      const report: QcReport = { ok: false, checks, fixesApplied, at: new Date().toISOString() };
+      failedClip.qc = report;
+      failedClip.status = 'qc_failed';
+      saveClip(failedClip);
+      cleanupRawMp4(clipId);
+      return report;
+    }
+    if (applied.descriptions.length === 0) break; // every planned fix turned out to be a no-op (shouldn't normally happen)
+    fixesApplied.push(...applied.descriptions);
     clip = loadClip(clipId); // pick up whatever renderClip/rebuildEdl/master persisted
   }
 
@@ -517,8 +569,7 @@ export async function qcClip(clipId: string): Promise<QcReport> {
   clip.status = ok ? 'ready' : 'qc_failed';
   saveClip(clip);
 
-  const rawPath = path.join(paths.clip(clipId), 'raw.mp4');
-  if (fs.existsSync(rawPath)) fs.rmSync(rawPath);
+  cleanupRawMp4(clipId);
 
   return report;
 }

@@ -28,6 +28,7 @@ type Piece = { start: number; end: number };
 type TimedWord = Word & { outStart: number; outEnd: number };
 
 const EDGE_GUARD = 0.3; // a shot cut must be this far from either edge of a run to be honoured
+const MIN_PIECE_SEC = 0.15; // a cut-edge sliver this short is keepHalf padding, not real content — drop, don't merge
 const PAGE_MAX_WORDS = 3;
 const PAGE_END_PAD = 0.4; // extra tail shown after the last word of a caption page
 const PAGE_GAP_BREAK = 0.3; // source-time gap that forces a caption page break
@@ -129,10 +130,22 @@ function splitAtShots(run: Piece, shots: Shot[], edgeGuard: number): Piece[] {
   return pieces;
 }
 
+const CONTIGUOUS_EPS = 1e-6; // pieces this close in time are "touching" (float noise aside), not really apart
+
 /**
- * Merges any piece shorter than `minSeg` into its previous piece (or the next one, if it's the
- * first piece of the run) by extending the neighbour and dropping the shot cut between them.
- * Restarts the scan after each merge so short pieces created by a merge cascade correctly. Pure.
+ * Merges any piece shorter than `minSeg` into whichever neighbour it's actually time-contiguous
+ * with (extending that neighbour and dropping the shot cut between them) — restarting the scan
+ * after each merge/drop so a cascade (a merge creating a new short piece) resolves correctly.
+ *
+ * Fix round 1 (2026-09-26): this now runs over a WHOLE range's pieces (every run within it, not
+ * just one run's own shot-split fragments — see `buildEdl`), so a short piece can have a neighbour
+ * from a *different* run: one separated by a real, deliberately-kept pause gap (the very thing
+ * `speechRuns`/`piecesFromCuts` just cut). Extending a piece's bound across that gap would silently
+ * re-include the cut dead air — exactly the bug this whole round exists to remove — so a short
+ * piece is merged (bounds extended) only into a neighbour it TOUCHES (contiguous in time, within
+ * `CONTIGUOUS_EPS`; always true for same-run shot-split fragments, by construction). A short piece
+ * with no contiguous neighbour on either side (an isolated short run, boxed in by real pause gaps
+ * on both sides) is dropped entirely instead of bridging one of those gaps. Pure.
  */
 function mergeShortPieces(pieces: Piece[], minSeg: number): Piece[] {
   const result = pieces.map((p) => ({ ...p }));
@@ -140,16 +153,19 @@ function mergeShortPieces(pieces: Piece[], minSeg: number): Piece[] {
   while (changed && result.length > 1) {
     changed = false;
     for (let i = 0; i < result.length; i++) {
-      if (result[i].end - result[i].start < minSeg) {
-        if (i > 0) {
-          result[i - 1] = { start: result[i - 1].start, end: result[i].end };
-        } else {
-          result[i + 1] = { start: result[i].start, end: result[i + 1].end };
-        }
-        result.splice(i, 1);
-        changed = true;
-        break;
+      if (result[i].end - result[i].start >= minSeg) continue;
+      const touchesPrev = i > 0 && Math.abs(result[i].start - result[i - 1].end) < CONTIGUOUS_EPS;
+      const touchesNext = i < result.length - 1 && Math.abs(result[i + 1].start - result[i].end) < CONTIGUOUS_EPS;
+      if (touchesPrev) {
+        result[i - 1] = { start: result[i - 1].start, end: result[i].end };
+      } else if (touchesNext) {
+        result[i + 1] = { start: result[i].start, end: result[i + 1].end };
       }
+      // else: isolated short piece, no contiguous neighbour on either side — drop it (below)
+      // rather than bridge a real gap.
+      result.splice(i, 1);
+      changed = true;
+      break;
     }
   }
   return result;
@@ -170,13 +186,19 @@ const RETIME_WINDOW = 0.25; // seconds a fully-swallowed word gets re-timed into
  *     the first `RETIME_WINDOW` seconds of the next piece (by source position) in this range, so
  *     it still appears once speech resumes instead of vanishing silently. Several such words
  *     collapsing on the same piece are spread evenly across that window, in their original
- *     (source-time) order.
+ *     (source-time) order. That window is bounded (fix round 1, 2026-09-26) to end at or before
+ *     the earliest REAL (non-orphan) word's own `outStart` in that same piece — without this, a
+ *     fixed 0.25s window could run past a real word that starts sooner (e.g. a short piece, or
+ *     several orphans stacking up), overlapping it. If there's no room left at all (the real word
+ *     starts exactly at the piece's own start), the orphan(s) are dropped rather than overlap —
+ *     every word this function emits is guaranteed `outEnd > outStart` and never overlaps another.
  * Restricted to one playback range's own pieces (not the whole clip's) so a word can't be
  * re-timed across the cold-open/main-range boundary, which isn't a "cut" in this sense. Pure.
  */
 function placeWords(words: Word[], range: Range, pieces: Piece[], pieceOuts: number[]): TimedWord[] {
   const timed: TimedWord[] = [];
   const orphansByPiece = new Map<number, Word[]>();
+  const firstRealStartByPiece = new Map<number, number>();
 
   const candidates = words.filter((w) => w.start >= range.start && w.start <= range.end);
   for (const w of candidates) {
@@ -200,13 +222,21 @@ function placeWords(words: Word[], range: Range, pieces: Piece[], pieceOuts: num
     const p = pieces[bestIdx];
     const clipStart = Math.max(w.start, p.start);
     const clipEnd = Math.min(w.end, p.end);
-    timed.push({ ...w, outStart: pieceOuts[bestIdx] + (clipStart - p.start), outEnd: pieceOuts[bestIdx] + (clipEnd - p.start) });
+    const outStart = pieceOuts[bestIdx] + (clipStart - p.start);
+    const outEnd = pieceOuts[bestIdx] + (clipEnd - p.start);
+    timed.push({ ...w, outStart, outEnd });
+    const prevFirst = firstRealStartByPiece.get(bestIdx);
+    if (prevFirst === undefined || outStart < prevFirst) firstRealStartByPiece.set(bestIdx, outStart);
   }
 
   for (const [pieceIdx, ws] of orphansByPiece) {
     const sorted = [...ws].sort((a, b) => a.start - b.start);
     const pieceOut = pieceOuts[pieceIdx];
-    const window = Math.min(RETIME_WINDOW, pieces[pieceIdx].end - pieces[pieceIdx].start);
+    const pieceEndOut = pieceOut + (pieces[pieceIdx].end - pieces[pieceIdx].start);
+    const nextRealStart = firstRealStartByPiece.get(pieceIdx);
+    const windowEnd = Math.min(pieceOut + RETIME_WINDOW, pieceEndOut, nextRealStart ?? Infinity);
+    const window = windowEnd - pieceOut;
+    if (window <= CONTIGUOUS_EPS) continue; // no room left before the next real word — drop rather than overlap it
     const slice = window / sorted.length;
     sorted.forEach((w, idx) => {
       timed.push({ ...w, outStart: pieceOut + idx * slice, outEnd: pieceOut + (idx + 1) * slice });
@@ -241,7 +271,7 @@ export function buildEdl(i: EdlInput): Edl {
   // Step 1: cold open (if any) plays first, then the main range.
   const ranges: Range[] = i.coldOpen ? [i.coldOpen, { start: i.start, end: i.end }] : [{ start: i.start, end: i.end }];
 
-  // Steps 2-3: pause-tightened runs, split at shot boundaries, short pieces merged away.
+  // Steps 2-3: pause-tightened runs, split at shot boundaries, short pieces merged/dropped away.
   const silences = i.silences ?? [];
   const pieces: Piece[] = [];
   // [start,end) index spans into `pieces` per entry of `ranges` — used below (step 6) so caption
@@ -250,9 +280,22 @@ export function buildEdl(i: EdlInput): Edl {
   const rangePieceSpans: { start: number; end: number }[] = [];
   for (const range of ranges) {
     const before = pieces.length;
+    // Every run's shot-split pieces are collected for the WHOLE range first, THEN cleaned once
+    // (fix round 1, 2026-09-26): a cut landing right at range.start/range.end (or two cuts close
+    // together) can leave a run that's entirely one tiny sliver, with no sibling of its own run to
+    // merge into — collecting across runs (still scoped to this one range) gives `MIN_PIECE_SEC`/
+    // `mergeShortPieces` a real neighbour to work with. `MIN_PIECE_SEC` (silence edge padding —
+    // pure `keepHalf` trim residue, never real spoken content) is dropped unconditionally before
+    // the minSeg merge pass runs, so it can't itself get merged into (and inflate) a neighbour.
+    const rangePieces: Piece[] = [];
     for (const run of speechRuns(range, i.words, maxPause, keepHalf, silences)) {
-      pieces.push(...mergeShortPieces(splitAtShots(run, i.shots, EDGE_GUARD), minSeg));
+      rangePieces.push(...splitAtShots(run, i.shots, EDGE_GUARD));
     }
+    const cleaned = mergeShortPieces(
+      rangePieces.filter((p) => p.end - p.start >= MIN_PIECE_SEC),
+      minSeg,
+    );
+    pieces.push(...cleaned);
     rangePieceSpans.push({ start: before, end: pieces.length });
   }
 

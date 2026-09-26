@@ -4,7 +4,7 @@ import { log, step } from './log.js';
 import { llmJson, setBackend, ledgerSummary } from './llm/llm.js';
 import { claudeBackend } from './llm/claude.js';
 import { listChannel, fetchSubs } from './yt/ytdlp.js';
-import { saveCreator, listCreators, paths, readJson, loadSource, loadCreator, newId, saveClip, listClips } from './store.js';
+import { saveCreator, listCreators, paths, readJson, loadSource, loadCreator, newId, saveClip, loadClip, listClips } from './store.js';
 import { mineCreator } from './mine/mine.js';
 import { loadPlaybook, savePlaybook, renderPlaybookMd } from './playbook/playbook.js';
 import { distill } from './playbook/distill.js';
@@ -84,6 +84,10 @@ function asStringArray(v: FlagValue | undefined): string[] {
   const arr = Array.isArray(v) ? v : [v];
   return arr.filter((x): x is string => typeof x === 'string');
 }
+
+// Mirrors types.ts's ClipStatus union exactly — used to validate `--status` on `requalify`
+// (and `clips --status`, informally) against a real value instead of silently casting a typo.
+const CLIP_STATUSES: ClipStatus[] = ['planned', 'rendered', 'qc_failed', 'ready', 'approved', 'rejected', 'published'];
 
 async function printDoctorReport(): Promise<boolean> {
   const rows = await runDoctor();
@@ -609,21 +613,52 @@ export const commands: Record<string, { help: string; run: (a: ParsedArgs) => Pr
       setBackend(claudeBackend);
       const clipId = a._[0];
       const sourceId = asString(a.flags.source);
-      const status = (asString(a.flags.status) ?? 'qc_failed') as ClipStatus;
+      const statusStr = asString(a.flags.status);
+
+      if (clipId && sourceId) {
+        log('usage: cb requalify <clipId> | cb requalify --source <sourceId> [--status qc_failed] — not both');
+        process.exitCode = 1;
+        return;
+      }
+      if (!clipId && !sourceId) {
+        log('usage: cb requalify <clipId> | cb requalify --source <sourceId> [--status qc_failed]');
+        process.exitCode = 1;
+        return;
+      }
+
+      let status: ClipStatus = 'qc_failed';
+      if (statusStr !== undefined) {
+        if (!CLIP_STATUSES.includes(statusStr as ClipStatus)) {
+          log(`requalify: invalid --status "${statusStr}" — must be one of: ${CLIP_STATUSES.join(', ')}`);
+          process.exitCode = 1;
+          return;
+        }
+        status = statusStr as ClipStatus;
+      }
 
       let clips: Clip[];
       if (clipId) {
-        clips = [await requalifyClip(clipId)];
-      } else if (sourceId) {
-        clips = await requalifySource(sourceId, status);
+        try {
+          clips = [await requalifyClip(clipId)];
+        } catch (err) {
+          const message = err instanceof Error ? err.message : String(err);
+          log(`requalify ${clipId}: failed: ${message}`);
+          try {
+            const failed = loadClip(clipId);
+            failed.error = message;
+            saveClip(failed);
+          } catch {
+            // clip couldn't even be loaded (bad id?) — nothing on disk to record the error on
+          }
+          process.exitCode = 1;
+          return;
+        }
+      } else {
+        clips = await requalifySource(sourceId!, status);
         if (clips.length === 0) {
           log(`requalify ${sourceId}: no clips with status=${status}`);
           return;
         }
-      } else {
-        log('usage: cb requalify <clipId> | cb requalify --source <sourceId> [--status qc_failed]');
-        process.exitCode = 1;
-        return;
       }
 
       console.log('id'.padEnd(14), 'status'.padEnd(11), 'dur'.padEnd(8), 'composite'.padEnd(10), 'hook');
@@ -632,6 +667,7 @@ export const commands: Record<string, { help: string; run: (a: ParsedArgs) => Pr
         const hook = c.error ? `ERROR: ${c.error}` : (c.hooks[c.hookIndex]?.text ?? '(no hook)');
         console.log(c.id.padEnd(14), c.status.padEnd(11), dur.padEnd(8), c.composite.toFixed(2).padEnd(10), hook);
       }
+      if (clips.some((c) => c.error)) process.exitCode = 1;
     },
   },
   run: {
