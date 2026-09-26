@@ -83,7 +83,7 @@ function systemPrompt(ctx: ProposeCtx): string {
   );
 }
 
-/** One LLM call proposing 0–8 candidate clips from a single transcript window. */
+/** One LLM call proposing 0–10 candidate clips from a single transcript window. */
 export async function proposeWindow(
   ctx: ProposeCtx,
   sentences: Sentence[],

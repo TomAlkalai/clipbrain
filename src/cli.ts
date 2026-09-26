@@ -14,6 +14,7 @@ import { scanVisual, computeFaceStats, writeFaceDebugSheets } from './analyze/vi
 import { analyzeSource } from './analyze/analyze.js';
 import { selectSource, openingClosing } from './select/select.js';
 import { mmss } from './select/propose.js';
+import { DEFAULT_WINDOW_SEC } from './select/snap.js';
 import { generateHooks } from './hooks/hooks.js';
 import { buildEdl } from './edit/edl.js';
 import { ensureHires, renderClip, truncateEdl } from './render/render.js';
@@ -321,15 +322,31 @@ export const commands: Record<string, { help: string; run: (a: ParsedArgs) => Pr
         process.exitCode = 1;
         return;
       }
-      setBackend(claudeBackend);
       const top = Number(asString(a.flags.top) ?? 6) || 6;
       const windowSecStr = asString(a.flags['window-sec']);
       const overlapSecStr = asString(a.flags['overlap-sec']);
+      const windowSec = windowSecStr !== undefined ? Number(windowSecStr) : undefined;
+      const overlapSec = overlapSecStr !== undefined ? Number(overlapSecStr) : undefined;
+      if (windowSec !== undefined && !(Number.isFinite(windowSec) && windowSec >= 60)) {
+        log(`select ${sourceId}: --window-sec must be a finite number >= 60 (got ${windowSecStr})`);
+        process.exitCode = 1;
+        return;
+      }
+      const effectiveWindowSec = windowSec ?? DEFAULT_WINDOW_SEC;
+      if (overlapSec !== undefined && !(Number.isFinite(overlapSec) && overlapSec >= 0 && overlapSec < effectiveWindowSec)) {
+        log(
+          `select ${sourceId}: --overlap-sec must be a finite number >= 0 and < window-sec ` +
+            `(${effectiveWindowSec}) (got ${overlapSecStr})`,
+        );
+        process.exitCode = 1;
+        return;
+      }
+      setBackend(claudeBackend);
       const candidates = await selectSource(sourceId, {
         top,
         force: Boolean(a.flags.force),
-        windowSec: windowSecStr ? Number(windowSecStr) : undefined,
-        overlapSec: overlapSecStr ? Number(overlapSecStr) : undefined,
+        windowSec,
+        overlapSec,
       });
       const shortlisted = candidates.filter((c) => c.shortlisted).sort((x, y) => (x.rank ?? 0) - (y.rank ?? 0));
 

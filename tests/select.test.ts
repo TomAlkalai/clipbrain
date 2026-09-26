@@ -22,6 +22,19 @@ it('defaults to 600s windows with 60s overlap when called with no explicit windo
   expect(w[w.length - 1].s1).toBe(99);
   for (let i = 1; i < w.length; i++) expect(w[i].s0).toBeLessThanOrEqual(w[i - 1].s1);
 });
+// Last-line-of-defense guards: a bad windowSec/overlapSec must fail loudly here rather than
+// silently produce a degenerate window count (e.g. one window per sentence with NaN inputs),
+// which would mean unbounded LLM calls in proposeWindow. The CLI validates its own flags before
+// ever calling windows(), but any other caller relies on this throw.
+it('windows throws when windowSec <= overlapSec', () => {
+  expect(() => windows(S, 60, 60)).toThrow();
+  expect(() => windows(S, 60, 90)).toThrow();
+});
+it('windows throws on non-finite windowSec or overlapSec', () => {
+  expect(() => windows(S, NaN, 60)).toThrow();
+  expect(() => windows(S, 600, NaN)).toThrow();
+  expect(() => windows(S, Infinity, 60)).toThrow();
+});
 it('snaps to sentence bounds with padding but not into neighbours', () => {
   const b = snapBounds(S, W, 3, 4);
   expect(b.start).toBeCloseTo(89.88); expect(b.end).toBeCloseTo(148.3);

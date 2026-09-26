@@ -14,6 +14,9 @@ export function candidateId(sourceId: string, startSid: number, endSid: number):
   return `cand_${hash.slice(0, 8)}`;
 }
 
+export const DEFAULT_WINDOW_SEC = 600;
+export const DEFAULT_OVERLAP_SEC = 60;
+
 /**
  * Splits `sentences` into overlapping windows of ~`windowSec` seconds (measured
  * from each window's first sentence start to its last sentence start), stepping
@@ -21,8 +24,23 @@ export function candidateId(sourceId: string, startSid: number, endSid: number):
  * index ranges [s0, s1] that together cover every sentence, with consecutive
  * windows overlapping by roughly `overlapSec` seconds so a clip near a window
  * boundary is never missed. Pure.
+ *
+ * Throws if either bound isn't finite or if `windowSec <= overlapSec` (a non-positive step would
+ * never advance `s0`, or with NaN inputs the `s1 + 1 < n` scan below never terminates in the
+ * intended way, either producing one window per sentence or looping unpredictably — either way,
+ * unbounded LLM calls downstream in `proposeWindow`). Callers that take these from user input
+ * (e.g. the CLI's `--window-sec`/`--overlap-sec`) should still validate and fail fast themselves,
+ * so the person gets a clear error instead of this throw — this guard is the last line of defense
+ * for any other caller.
  */
-export function windows(sentences: Sentence[], windowSec = 600, overlapSec = 60): { s0: number; s1: number }[] {
+export function windows(
+  sentences: Sentence[],
+  windowSec = DEFAULT_WINDOW_SEC,
+  overlapSec = DEFAULT_OVERLAP_SEC,
+): { s0: number; s1: number }[] {
+  if (!Number.isFinite(windowSec) || !Number.isFinite(overlapSec) || windowSec <= overlapSec) {
+    throw new Error(`windows: windowSec (${windowSec}) must be finite and greater than overlapSec (${overlapSec})`);
+  }
   const n = sentences.length;
   if (n === 0) return [];
   const step = windowSec - overlapSec;
