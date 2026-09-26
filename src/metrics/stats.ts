@@ -126,20 +126,57 @@ export async function collectStats(): Promise<number> {
   return updated;
 }
 
-export function parseStatsCsv(text: string): { clipId: string; views: number; avgViewPct: number }[] {
+export type CsvRowError = { line: number; raw: string; message: string };
+type ParsedRow = { line: number; raw: string; clipId: string; views: number; avgViewPct?: number };
+
+// Pure: validates each data row (clipId,views,avgViewPct) — views must be a finite number >= 0;
+// avgViewPct is optional but when present must be finite and within 0-100. Invalid rows are
+// reported as errors rather than turned into NaN metrics, and are excluded from `rows`.
+export function parseStatsCsv(text: string): { rows: ParsedRow[]; errors: CsvRowError[] } {
   const lines = text.split(/\r?\n/).filter((l) => l.trim().length > 0);
-  const rows = lines.slice(1); // skip header: clipId,views,avgViewPct
-  return rows.map((line) => {
-    const [clipId, views, avgViewPct] = line.split(',').map((s) => s.trim());
-    return { clipId, views: Number(views), avgViewPct: Number(avgViewPct) };
+  const dataLines = lines.slice(1); // skip header: clipId,views,avgViewPct
+  const rows: ParsedRow[] = [];
+  const errors: CsvRowError[] = [];
+
+  dataLines.forEach((raw, i) => {
+    const line = i + 2; // 1-based, +1 to account for the header row
+    const [clipId, viewsRaw, avgViewPctRaw] = raw.split(',').map((s) => s.trim());
+
+    if (!clipId) {
+      errors.push({ line, raw, message: 'missing clipId' });
+      return;
+    }
+
+    const views = Number(viewsRaw);
+    if (viewsRaw === undefined || viewsRaw === '' || !Number.isFinite(views) || views < 0) {
+      errors.push({ line, raw, message: `views must be a finite number >= 0 (got "${viewsRaw ?? ''}")` });
+      return;
+    }
+
+    let avgViewPct: number | undefined;
+    if (avgViewPctRaw !== undefined && avgViewPctRaw !== '') {
+      avgViewPct = Number(avgViewPctRaw);
+      if (!Number.isFinite(avgViewPct) || avgViewPct < 0 || avgViewPct > 100) {
+        errors.push({ line, raw, message: `avgViewPct must be a finite number 0-100 (got "${avgViewPctRaw}")` });
+        return;
+      }
+    }
+
+    rows.push({ line, raw, clipId, views, avgViewPct });
   });
+
+  return { rows, errors };
 }
 
+export type CsvImportResult = { updated: number; errors: CsvRowError[] };
+
 // Manually posted TikTok/IG copies: clipId,views,avgViewPct rows become metrics snapshots
-// tagged source:'csv'. Loads clips individually so one bad row doesn't abort the rest.
-export async function importCsv(csvPath: string): Promise<number> {
+// tagged source:'csv'. Loads clips individually so one bad row doesn't abort the rest; invalid
+// rows (bad numbers, unknown clip id) are skipped and collected in `errors`, which the caller can
+// inspect. Kept alongside `importCsv`, which stays on the CLI-facing `Promise<number>` contract.
+export async function importCsvDetailed(csvPath: string): Promise<CsvImportResult> {
   const text = fs.readFileSync(csvPath, 'utf8');
-  const rows = parseStatsCsv(text);
+  const { rows, errors } = parseStatsCsv(text);
   const at = new Date().toISOString();
   let updated = 0;
 
@@ -148,13 +185,31 @@ export async function importCsv(csvPath: string): Promise<number> {
     try {
       clip = loadClip(r.clipId);
     } catch {
-      log(`stats import: no such clip ${r.clipId}, skipping`);
+      errors.push({ line: r.line, raw: r.raw, message: `no such clip "${r.clipId}"` });
       continue;
     }
     clip.metrics = clip.metrics ?? [];
     clip.metrics.push({ at, views: r.views, avgViewPct: r.avgViewPct, source: 'csv' });
     saveClip(clip);
     updated++;
+  }
+
+  for (const e of errors) {
+    log(`stats import: line ${e.line}: ${e.message} (${e.raw})`);
+  }
+
+  return { updated, errors };
+}
+
+// CLI-facing wrapper: keeps the original Promise<number> contract (the count of clips updated)
+// so callers that only want "how many rows landed" don't need to unpack a result object, while
+// still reporting row errors and exiting non-zero when any row was invalid — the CSV can come
+// from a hand-edited spreadsheet, so silently swallowing a bad row would corrupt a clip's metrics
+// history without anyone noticing.
+export async function importCsv(csvPath: string): Promise<number> {
+  const { updated, errors } = await importCsvDetailed(csvPath);
+  if (errors.length > 0) {
+    process.exitCode = 1;
   }
   return updated;
 }

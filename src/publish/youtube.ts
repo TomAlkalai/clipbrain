@@ -11,10 +11,35 @@ const MAX_TITLE_LEN = 100;
 const MAX_DESCRIPTION_LEN = 4900;
 const SHORTS_SUFFIX = ' #shorts';
 
+// produce.ts's attribution() always appends "\n\nFrom \"<title>\" — <creator>\nFull episode: ...".
+// Description truncation must find this marker and cut the body before it, never the marker itself.
+const ATTRIBUTION_MARKER = '\n\nFrom "';
+
 export type UploadRequest = {
   snippet: { title: string; description: string; tags: string[]; categoryId: '22' };
   status: { privacyStatus: 'private'; publishAt?: string; selfDeclaredMadeForKids: false };
 };
+
+// Pure: clamps a description to maxLen without ever cutting into the attribution block that
+// attribution() appends at the end (creator name, full-episode link) — only the body ahead of it
+// is trimmed, with a trailing "…" marking the cut. If the attribution block itself is longer than
+// maxLen (pathological), it wins outright and gets truncated from its own start instead.
+export function clampDescription(description: string, maxLen: number = MAX_DESCRIPTION_LEN): string {
+  if (description.length <= maxLen) return description;
+
+  const markerIdx = description.lastIndexOf(ATTRIBUTION_MARKER);
+  if (markerIdx === -1) {
+    return description.slice(0, Math.max(0, maxLen - 1)) + '…';
+  }
+
+  const attribution = description.slice(markerIdx);
+  if (attribution.length >= maxLen) return attribution.slice(0, maxLen);
+
+  const body = description.slice(0, markerIdx);
+  const budget = maxLen - attribution.length;
+  const truncatedBody = body.slice(0, Math.max(0, budget - 1)) + '…';
+  return truncatedBody + attribution;
+}
 
 // Pure: builds the exact request body sent to the YouTube Data API. Title stays <= 100 chars;
 // ` #shorts` is appended only when it still fits. Description keeps the attribution that's
@@ -26,8 +51,7 @@ export function buildUploadRequest(clip: Clip, o: { publishAt?: string }): Uploa
     title = title + SHORTS_SUFFIX;
   }
 
-  let description = clip.description;
-  if (description.length > MAX_DESCRIPTION_LEN) description = description.slice(0, MAX_DESCRIPTION_LEN);
+  const description = clampDescription(clip.description, MAX_DESCRIPTION_LEN);
 
   const tags = clip.hashtags.map((h) => h.replace(/^#/, ''));
 
@@ -129,8 +153,20 @@ async function resumableUpload(client: OAuth2Client, req: UploadRequest, filePat
   return uploaded.id;
 }
 
+// Pure: missing/blank config means the default cap of 10; "0" is a valid, deliberate value
+// (publishing paused); anything non-numeric or negative is a config mistake, not a value to
+// silently paper over, so it throws rather than falling back to a default.
+export function parseDailyCap(raw: string | undefined): number {
+  if (raw === undefined || raw.trim() === '') return 10;
+  const n = Number(raw);
+  if (!Number.isFinite(n) || n < 0) {
+    throw new Error(`invalid CB_PUBLISH_DAILY_CAP "${raw}": must be a non-negative number (0 pauses publishing)`);
+  }
+  return n;
+}
+
 export async function publish(o: { live: boolean; clipId?: string }): Promise<void> {
-  const dailyCap = Number(env('CB_PUBLISH_DAILY_CAP', '10')) || 10;
+  const dailyCap = parseDailyCap(env('CB_PUBLISH_DAILY_CAP'));
   const now = new Date();
 
   const allClips = listClips();
