@@ -440,7 +440,7 @@ export async function qcClip(clipId: string): Promise<QcReport> {
     const degradedChecks: QcCheck[] = [];
     if (measures.contentError) {
       degradedChecks.push({
-        name: 'critique_unavailable',
+        name: 'content_unavailable',
         ok: false,
         detail: `qc-content unavailable: ${measures.contentError}`,
         severity: 'warn',
@@ -448,7 +448,7 @@ export async function qcClip(clipId: string): Promise<QcReport> {
     }
     if (visionOutcome.error) {
       degradedChecks.push({
-        name: 'critique_unavailable',
+        name: 'vision_unavailable',
         ok: false,
         detail: `qc-vision unavailable: ${visionOutcome.error}`,
         severity: 'warn',
@@ -470,6 +470,7 @@ export async function qcClip(clipId: string): Promise<QcReport> {
       minSec: bounds.minSec,
       maxSec: bounds.maxSec,
       sentences,
+      style: clip.style ?? 'default',
     });
     if (!plan) break;
 

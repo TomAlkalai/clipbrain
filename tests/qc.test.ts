@@ -221,6 +221,7 @@ const CTX: FixCtx = {
   hookIndex: 0,
   hookCount: 2,
   allNonFitSegments: [0, 1, 2],
+  style: 'default',
   start: 0,
   end: 5,
   minSec: 2,
@@ -352,6 +353,22 @@ it('planFix: move_hook_up still yields to rule-based fixes (e.g. loudness) when 
   const checks = evaluate({ ...PASSING, loudness: { i: -20, tp: -1.2 } }, EXPECTED_DURATION);
   const v: VisionCritique = { ...KEEP, verdict: 'reject', overlaysCoverFace: true };
   expect(planFix(checks, PASSING, v, CTX)).toEqual({ kind: 'remaster', reason: 'loudness/true_peak out of spec' });
+});
+
+it('planFix: move_hook_up is skipped once already applied (style already hook-high) — repeated overlaysCoverFace falls through to null', () => {
+  // Fix round 2, item 1: previously this would re-plan (and re-render for) an identical,
+  // no-op move_hook_up every round the vision critic repeated the same complaint.
+  const checks = evaluate(OK_MEASURES, EXPECTED_DURATION);
+  const alreadyHookHighCtx: FixCtx = { ...CTX, style: 'hook-high' };
+  const v: VisionCritique = { ...KEEP, verdict: 'reject', overlaysCoverFace: true, improvements: ['move_hook_up'] };
+  expect(planFix(checks, OK_MEASURES, v, alreadyHookHighCtx)).toBeNull();
+});
+
+it('planFix: move_hook_up already applied falls through to the NEXT feasible vision improvement, not straight to null', () => {
+  const checks = evaluate(OK_MEASURES, EXPECTED_DURATION);
+  const alreadyHookHighCtx: FixCtx = { ...CTX, style: 'hook-high' };
+  const v: VisionCritique = { ...KEEP, verdict: 'improve', overlaysCoverFace: true, improvements: ['move_hook_up', 'trim_start'] };
+  expect(planFix(checks, OK_MEASURES, v, alreadyHookHighCtx)).toEqual({ kind: 'trim_start', newStart: 2, reason: 'vision: trim_start' });
 });
 
 it('planFix: nothing to fix (all pass, verdict keep) returns null', () => {

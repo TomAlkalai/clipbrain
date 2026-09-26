@@ -10,7 +10,7 @@ export type Measures = {
   content: { standalone: boolean; cleanEnding: boolean; hookMatches: boolean; issues: string[] } | null;
   maxCaptionChars: number;
   /** Set (and `content` left null) when the qc-content LLM call threw — surfaced by qc.ts as a
-   * warn-severity `critique_unavailable` check rather than crashing the whole QC run. */
+   * warn-severity `content_unavailable` check (qc.ts) rather than crashing the whole QC run. */
   contentError?: string;
 };
 
@@ -225,6 +225,10 @@ export type FixCtx = {
   minSec: number;
   maxSec: number;
   sentences: Sentence[];
+  /** clip.style ?? 'default' — lets a `move_hook_up` fix already applied (style === 'hook-high')
+   * be skipped rather than re-chosen (and re-rendered) for an identical, no-op style change when
+   * the vision critic repeats the same overlaysCoverFace complaint (Task 13 fix round 2). */
+  style: string;
 };
 
 /** The new `end` an `extend_end` fix would use, or null if there's no later sentence, or if
@@ -256,8 +260,10 @@ function feasibleTrimStart(ctx: FixCtx): number | null {
  * bounds, no next hook variant to advance to) falls through to the next candidate in priority
  * order, rather than the whole round giving up. `vision.overlaysCoverFace` (or an explicit
  * `move_hook_up` improvement) maps to a style change moving the hook overlay clear of the
- * speaker's face, ahead of the other vision improvements (Task 13 fix round 1). Returns null only
- * when nothing left is fixable (QC then finalizes as-is). Pure.
+ * speaker's face, ahead of the other vision improvements (Task 13 fix round 1) — unless
+ * `ctx.style` is already `'hook-high'`, in which case that fix is skipped (it would be a no-op
+ * re-render) and falls through like any other infeasible candidate (Task 13 fix round 2). Returns
+ * null only when nothing left is fixable (QC then finalizes as-is). Pure.
  */
 export function planFix(checks: QcCheck[], measures: Measures, vision: VisionCritique | null, ctx: FixCtx): FixPlan | null {
   const failing = (name: string) => checks.some((c) => c.name === name && !c.ok);
@@ -281,7 +287,8 @@ export function planFix(checks: QcCheck[], measures: Measures, vision: VisionCri
   }
 
   if (vision && vision.verdict !== 'keep') {
-    if (vision.overlaysCoverFace) {
+    const styleAlreadyHookHigh = ctx.style === 'hook-high';
+    if (vision.overlaysCoverFace && !styleAlreadyHookHigh) {
       return { kind: 'move_hook_up', reason: 'vision: overlays cover face' };
     }
     for (const improvement of vision.improvements) {
@@ -298,7 +305,9 @@ export function planFix(checks: QcCheck[], measures: Measures, vision: VisionCri
         const newStart = feasibleTrimStart(ctx);
         if (newStart !== null) return { kind: 'trim_start', newStart, reason: 'vision: trim_start' };
       } else if (improvement === 'move_hook_up') {
-        return { kind: 'move_hook_up', reason: 'vision: move_hook_up' };
+        if (!styleAlreadyHookHigh) return { kind: 'move_hook_up', reason: 'vision: move_hook_up' };
+        // else: already applied — fall through to the next improvement, if any (same as every
+        // other infeasible candidate above).
       }
     }
   }
