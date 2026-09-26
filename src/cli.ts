@@ -16,7 +16,7 @@ import { selectSource, openingClosing } from './select/select.js';
 import { mmss } from './select/propose.js';
 import { generateHooks } from './hooks/hooks.js';
 import { buildEdl } from './edit/edl.js';
-import { ensureHires, renderClip } from './render/render.js';
+import { ensureHires, renderClip, truncateEdl } from './render/render.js';
 import { authorize } from './publish/oauth.js';
 import { publish } from './publish/youtube.js';
 import { collectStats, importCsv } from './metrics/stats.js';
@@ -437,7 +437,7 @@ export const commands: Record<string, { help: string; run: (a: ParsedArgs) => Pr
     },
   },
   'render-test': {
-    help: 'render-test <sourceId> — build a Clip from the rank-1 shortlisted candidate and render it end-to-end (live smoke test).',
+    help: 'render-test <sourceId> [--max-sec N] — build a Clip from the rank-1 shortlisted candidate and render it end-to-end (live smoke test); --max-sec truncates the EDL for fast iteration.',
     async run(a) {
       const sourceId = a._[0];
       if (!sourceId) {
@@ -503,6 +503,11 @@ export const commands: Record<string, { help: string; run: (a: ParsedArgs) => Pr
         style: 'default',
         override: creator.layoutOverride,
       });
+      const maxSec = Number(asString(a.flags['max-sec']) ?? '');
+      if (Number.isFinite(maxSec) && maxSec > 0) {
+        clip.edl = truncateEdl(clip.edl, maxSec);
+        log(`render-test ${id}: truncated to ${maxSec}s for fast iteration (--max-sec)`);
+      }
       saveClip(clip);
 
       log(`render-test ${id}: edl built (${clip.edl.segments.length} segments, ${clip.edl.durationSec.toFixed(1)}s)`);

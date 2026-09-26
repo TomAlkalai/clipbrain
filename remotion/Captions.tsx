@@ -3,7 +3,11 @@ import { AbsoluteFill, spring, useCurrentFrame, useVideoConfig } from 'remotion'
 import { loadFont } from '@remotion/google-fonts/Montserrat';
 import type { EdlCaption } from '../src/types';
 
-const { fontFamily } = loadFont();
+// Scoped to exactly the weight/subset actually used (weight 900, latin) instead of the default
+// "all weights, all subsets" — that default was measured making 45-90 font network requests per
+// browser tab (each of Remotion's parallel render tabs loads fonts independently, so this cost is
+// paid once per tab); see fix round 1 in task-12-report.md.
+const { fontFamily } = loadFont('normal', { weights: ['900'], subsets: ['latin'], ignoreTooManyRequestsWarning: true });
 
 const PAGE_ENTRY_FRAMES = 6;
 

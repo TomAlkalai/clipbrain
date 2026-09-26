@@ -2,7 +2,9 @@ import React from 'react';
 import { AbsoluteFill, interpolate, spring, useCurrentFrame, useVideoConfig } from 'remotion';
 import { loadFont } from '@remotion/google-fonts/Montserrat';
 
-const { fontFamily } = loadFont();
+// Scoped to exactly the weight/subset actually used (weight 800, latin) — see Captions.tsx and
+// fix round 1 in task-12-report.md.
+const { fontFamily } = loadFont('normal', { weights: ['800'], subsets: ['latin'], ignoreTooManyRequestsWarning: true });
 
 const ENTRY_FRAMES = 8;
 const FADE_FRAMES = 6;

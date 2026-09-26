@@ -9,18 +9,28 @@ import { downloadSection } from '../yt/ytdlp.js';
 import { paths, loadClip, saveClip } from '../store.js';
 import { log } from '../log.js';
 import { startStaticServer } from './static.js';
-import type { Clip, Edl, Source } from '../types.js';
+import type { Clip, Edl, EdlCaption, EdlSegment, Source } from '../types.js';
 
 // The webpack bundle of remotion/index.ts is process-lifetime cacheable — every renderClip()
-// call reuses it instead of re-bundling.
+// call reuses it instead of re-bundling. A rejected bundle attempt must NOT stay cached: a
+// transient failure (e.g. a busy port, a one-off webpack hiccup) would otherwise permanently
+// fail every subsequent renderClip() call for the rest of the process's lifetime.
 let bundleLocationPromise: Promise<string> | undefined;
 
 function getBundleLocation(): Promise<string> {
   if (!bundleLocationPromise) {
-    bundleLocationPromise = bundle({ entryPoint: path.join(ROOT, 'remotion', 'index.ts') });
+    bundleLocationPromise = bundle({ entryPoint: path.join(ROOT, 'remotion', 'index.ts') }).catch((err) => {
+      bundleLocationPromise = undefined;
+      throw err;
+    });
   }
   return bundleLocationPromise;
 }
+
+// Fix round 1 (concurrency experiment, see task-12-report.md): measured a 20s truncated render at
+// Remotion's own default concurrency vs an explicit concurrency=6 on this machine — the default
+// was measurably faster (69.3s vs 71.7s), so `concurrency` is deliberately left unset below and
+// Remotion's own (CPU-core-based) heuristic is used.
 
 // A Chrome headless shell cached for a sibling project on this machine (same Remotion version).
 // Reused here to avoid a redundant browser download; falls back to Remotion's own resolution
@@ -117,23 +127,39 @@ export function parseLoudnorm(stderr: string): LoudnormMeasured {
   };
 }
 
-const LOUDNESS_TARGET = { I: -14, TP: -1.0, LRA: 11 };
+const LOUDNESS_I = -14;
+const LOUDNESS_LRA = 11;
+const MASTER_TP_INITIAL = -2.0;
+const MASTER_TP_RETRY = -3.0;
+
+// Acceptance window for the *delivered* (post-AAC-encode) file, measured independently with
+// ebur128 rather than trusted from loudnorm's own pre-encode estimate (see fix round 1 in
+// task-12-report.md: AAC re-encoding can overshoot loudnorm's own pre-encode true-peak result by
+// ~0.5 dB, so the loudnorm target itself is aimed at TP -2.0/-3.0, well below the -1.0 ceiling
+// actually required of the delivered file).
+const DELIVERED_TP_CEILING_DBTP = -1.0;
+const DELIVERED_I_MIN_LUFS = LOUDNESS_I - 1.5;
+const DELIVERED_I_MAX_LUFS = LOUDNESS_I + 1.5;
+
+function nullSink(): string {
+  return process.platform === 'win32' ? 'NUL' : '/dev/null';
+}
 
 /**
- * Two-pass loudness mastering to −14 LUFS integrated / −1.0 dBTP / 11 LRA: pass 1 measures the
- * input with `loudnorm` in analysis mode, pass 2 applies `linear=true` normalization using those
- * measured values (more transparent than single-pass/dynamic normalization). Video is stream-
- * copied; audio is re-encoded to AAC 48 kHz. `+faststart` moves the moov atom to the front for
- * progressive playback/upload.
+ * Runs ffmpeg's two-pass loudnorm (pass 1 measures, pass 2 applies `linear=true` using those
+ * measured values — more transparent than single-pass/dynamic normalization, though ffmpeg can
+ * still fall back to dynamic mode internally when linear gain would blow the TP ceiling on a very
+ * quiet input) targeting I=-14/LRA=11 and the given `tp` ceiling. Video is stream-copied; audio is
+ * re-encoded to AAC 48 kHz. `+faststart` moves the moov atom to the front for progressive
+ * playback/upload.
  */
-export async function master(rawMp4: string, outMp4: string): Promise<void> {
-  const nullSink = process.platform === 'win32' ? 'NUL' : '/dev/null';
+async function loudnormPass(rawMp4: string, outMp4: string, tp: number): Promise<void> {
   const pass1 = await run(ffmpeg(), [
     '-y',
     '-i', rawMp4,
-    '-af', `loudnorm=I=${LOUDNESS_TARGET.I}:TP=${LOUDNESS_TARGET.TP}:LRA=${LOUDNESS_TARGET.LRA}:print_format=json`,
+    '-af', `loudnorm=I=${LOUDNESS_I}:TP=${tp}:LRA=${LOUDNESS_LRA}:print_format=json`,
     '-f', 'null',
-    nullSink,
+    nullSink(),
   ]);
   if (pass1.code !== 0) {
     throw new Error(`master: loudnorm analysis pass failed (code ${pass1.code}): ${pass1.stderr.slice(-2000)}`);
@@ -141,7 +167,7 @@ export async function master(rawMp4: string, outMp4: string): Promise<void> {
   const measured = parseLoudnorm(pass1.stderr);
 
   const af =
-    `loudnorm=I=${LOUDNESS_TARGET.I}:TP=${LOUDNESS_TARGET.TP}:LRA=${LOUDNESS_TARGET.LRA}` +
+    `loudnorm=I=${LOUDNESS_I}:TP=${tp}:LRA=${LOUDNESS_LRA}` +
     `:measured_I=${measured.input_i}:measured_TP=${measured.input_tp}:measured_LRA=${measured.input_lra}` +
     `:measured_thresh=${measured.input_thresh}:offset=${measured.target_offset}:linear=true:print_format=summary`;
 
@@ -157,6 +183,135 @@ export async function master(rawMp4: string, outMp4: string): Promise<void> {
     '-movflags', '+faststart',
     outMp4,
   ]);
+}
+
+/**
+ * Parses ffmpeg's `ebur128` filter summary (with `peak=true`) out of its stderr — used to measure
+ * the *delivered* file directly (post-AAC-encode), independent of whatever loudnorm assumed while
+ * producing it. Scans from the last `Summary:` marker (ebur128 also logs a running per-frame line
+ * that reuses the same field names, so anchoring on the summary block avoids matching those). Pure.
+ */
+export function parseEbur128Summary(stderr: string): { integratedLufs: number; truePeakDbtp: number } {
+  const idx = stderr.lastIndexOf('Summary:');
+  const summary = idx === -1 ? stderr : stderr.slice(idx);
+  const iMatch = /Integrated loudness:\s*\n\s*I:\s*(-?\d+(?:\.\d+)?)\s*LUFS/.exec(summary);
+  const peakMatch = /True peak:\s*\n\s*Peak:\s*(-?\d+(?:\.\d+)?)\s*dBFS/.exec(summary);
+  if (!iMatch || !peakMatch) {
+    throw new Error('parseEbur128Summary: could not find integrated loudness / true peak in ebur128 summary');
+  }
+  return { integratedLufs: Number(iMatch[1]), truePeakDbtp: Number(peakMatch[1]) };
+}
+
+async function measureDelivered(file: string): Promise<{ integratedLufs: number; truePeakDbtp: number }> {
+  const r = await run(ffmpeg(), ['-y', '-i', file, '-af', 'ebur128=peak=true', '-f', 'null', nullSink()]);
+  if (r.code !== 0) {
+    throw new Error(`master: ebur128 measurement of delivered file failed (code ${r.code}): ${r.stderr.slice(-2000)}`);
+  }
+  return parseEbur128Summary(r.stderr);
+}
+
+export type MasterRetryPlan = { action: 'accept' } | { action: 'retry'; tp: number } | { action: 'fail'; reason: string };
+
+/**
+ * Decides what to do about a delivered (post-encode) loudness measurement: accept it, retry once
+ * (at a lower loudnorm TP ceiling, to claw back the AAC-overshoot headroom), or give up. Pure —
+ * the actual re-mastering + re-measuring is done by the caller (`master`).
+ */
+export function masterRetryPlan(measured: { integratedLufs: number; truePeakDbtp: number }, hasRetried: boolean): MasterRetryPlan {
+  const tpOk = measured.truePeakDbtp <= DELIVERED_TP_CEILING_DBTP;
+  const iOk = measured.integratedLufs >= DELIVERED_I_MIN_LUFS && measured.integratedLufs <= DELIVERED_I_MAX_LUFS;
+  if (tpOk && iOk) return { action: 'accept' };
+  if (!hasRetried) return { action: 'retry', tp: MASTER_TP_RETRY };
+  return {
+    action: 'fail',
+    reason:
+      `master: delivered audio still out of spec after retry — integrated ${measured.integratedLufs.toFixed(1)} LUFS ` +
+      `(want ${DELIVERED_I_MIN_LUFS}..${DELIVERED_I_MAX_LUFS}), true peak ${measured.truePeakDbtp.toFixed(1)} dBTP ` +
+      `(want <= ${DELIVERED_TP_CEILING_DBTP})`,
+  };
+}
+
+/**
+ * Masters `rawMp4` to broadcast loudness, verifying the *delivered* file rather than trusting
+ * loudnorm's own pre-encode estimate (AAC re-encoding can overshoot it — see fix round 1 in
+ * task-12-report.md). Masters at TP -2.0 first; if the delivered file's independently-measured
+ * loudness/peak still misses spec, re-masters once from `rawMp4` at TP -3.0; if it still misses
+ * after that, throws (QC surfaces the failure rather than silently shipping an out-of-spec file).
+ */
+export async function master(rawMp4: string, outMp4: string): Promise<void> {
+  await loudnormPass(rawMp4, outMp4, MASTER_TP_INITIAL);
+  let measured = await measureDelivered(outMp4);
+  let plan = masterRetryPlan(measured, false);
+  if (plan.action === 'retry') {
+    log(
+      `master: delivered audio out of spec (I=${measured.integratedLufs.toFixed(1)} LUFS, TP=${measured.truePeakDbtp.toFixed(1)} dBTP) — re-mastering at TP=${plan.tp}`,
+    );
+    await loudnormPass(rawMp4, outMp4, plan.tp);
+    measured = await measureDelivered(outMp4);
+    plan = masterRetryPlan(measured, true);
+  }
+  if (plan.action === 'fail') throw new Error(plan.reason);
+}
+
+/**
+ * Truncates an EDL to its first `maxSec` seconds of output-timeline duration — for fast local
+ * iteration on a render (`cb render-test <sourceId> --max-sec N`) without waiting out a full,
+ * possibly multi-minute-long clip. Keeps whole segments that fit, clips the segment straddling
+ * the cutoff (shortening its `srcEnd` by exactly the overrun), drops caption pages that start at
+ * or after the cutoff and clips the end of any page that straddles it, and clips the hook's end
+ * the same way. Pure.
+ */
+export function truncateEdl(edl: Edl, maxSec: number): Edl {
+  if (maxSec <= 0) throw new Error('truncateEdl: maxSec must be > 0');
+
+  let acc = 0;
+  const segments: EdlSegment[] = [];
+  for (const s of edl.segments) {
+    if (acc >= maxSec) break;
+    const segDur = s.srcEnd - s.srcStart;
+    const remaining = maxSec - acc;
+    if (segDur <= remaining) {
+      segments.push(s);
+      acc += segDur;
+    } else {
+      segments.push({ srcStart: s.srcStart, srcEnd: s.srcStart + remaining, layout: s.layout });
+      acc += remaining;
+      break;
+    }
+  }
+  const durationSec = Math.min(acc, maxSec);
+
+  const captions: EdlCaption[] = edl.captions
+    .filter((c) => c.start < durationSec)
+    .map((c) => ({ ...c, end: Math.min(c.end, durationSec) }));
+
+  const hook = edl.hook ? { ...edl.hook, end: Math.min(edl.hook.end, durationSec) } : null;
+
+  return { ...edl, segments, captions, hook, durationSec };
+}
+
+const DELIVERABLE_PIX_FMT = 'yuv420p';
+
+/**
+ * Asserts the delivered file's video stream is exactly `yuv420p` — not `yuvj420p` (the
+ * full-range/legacy-JPEG-range variant ffprobe reports when the encode isn't tagged with an
+ * explicit limited-range color space; see fix round 1 in task-12-report.md, `colorSpace: 'bt709'`
+ * on `renderMedia` is what avoids it). QC (Task 13) should apply this same strict check rather
+ * than treating `yuvj420p` as an acceptable equivalent.
+ */
+export async function assertDeliverablePixelFormat(file: string): Promise<void> {
+  const r = await runOk(ffprobe(), [
+    '-v', 'error',
+    '-select_streams', 'v:0',
+    '-show_entries', 'stream=pix_fmt',
+    '-of', 'json',
+    file,
+  ]);
+  const j = JSON.parse(r.stdout);
+  const pixFmt = j.streams?.[0]?.pix_fmt;
+  if (pixFmt !== DELIVERABLE_PIX_FMT) {
+    throw new Error(`assertDeliverablePixelFormat: ${file} has pix_fmt="${pixFmt}", expected exactly "${DELIVERABLE_PIX_FMT}"`);
+  }
 }
 
 /**
@@ -197,6 +352,7 @@ export async function renderClip(clipId: string): Promise<void> {
       crf: 18,
       audioCodec: 'aac',
       pixelFormat: 'yuv420p',
+      colorSpace: 'bt709',
       outputLocation: rawPath,
       inputProps,
       browserExecutable: chrome,
@@ -211,6 +367,7 @@ export async function renderClip(clipId: string): Promise<void> {
 
     const renderPath = path.join(dir, 'render.mp4');
     await master(rawPath, renderPath);
+    await assertDeliverablePixelFormat(renderPath);
 
     const posterPath = path.join(dir, 'poster.jpg');
     await runOk(ffmpeg(), ['-y', '-ss', '1.0', '-i', renderPath, '-frames:v', '1', '-vf', 'scale=360:-2', posterPath]);
