@@ -229,6 +229,12 @@ export type FixCtx = {
    * be skipped rather than re-chosen (and re-rendered) for an identical, no-op style change when
    * the vision critic repeats the same overlaysCoverFace complaint (Task 13 fix round 2). */
   style: string;
+  /** clip.qcFixHistory ?? [] — every `FixPlan['kind']` already applied to this clip across its
+   * whole QC lifetime (not just this round/call). Currently only `loosen_pauses` reads this:
+   * it has a single fixed level (maxPause -> 0.3), so "already applied" and "maxPause already
+   * <= 0.3" are the same condition — re-issuing it a second time changes nothing and just costs
+   * another re-render (QC-loop efficiency fix, 2026-09-26; see debug-dead-air.md). */
+  qcFixHistory: string[];
 };
 
 /** The new `end` an `extend_end` fix would use, or null if there's no later sentence, or if
@@ -251,68 +257,121 @@ function feasibleTrimStart(ctx: FixCtx): number | null {
 }
 
 /**
- * Decides the single next auto-fix action for a QC round, given the round's checks/measures and
- * (if run) the vision critique. Rule-based fixes (loudness/true_peak, clean_ending, hook_matches,
- * framing, dead_air) take priority, in the order task-13-brief.md lists them, over vision-driven
- * ones — a vision fix is only considered once none of the rule-based failures have an applicable
- * fix. Every candidate fix is feasibility-checked here (not just planned and later declined by
- * the caller) — an infeasible one (no next sentence to extend/trim to, would blow the duration
- * bounds, no next hook variant to advance to) falls through to the next candidate in priority
- * order, rather than the whole round giving up. `vision.overlaysCoverFace` (or an explicit
+ * Decides the FULL batch of auto-fix actions for a QC round, given the round's checks/measures
+ * and (if run) the vision critique — every compatible, feasible fix is returned together so
+ * `applyFixPlan` (qc.ts) can apply them all before a single re-render, instead of spending a whole
+ * round (and its ~12-16 min re-render) on just one (QC-loop efficiency fix, 2026-09-26; see
+ * debug-dead-air.md, "Only one fix is applied per round, so valid vision complaints never got a
+ * round"). "Compatible" means the batch never contains more than one *boundary* change
+ * (extend_end/trim_start — they both rewrite clip.start/end) or more than one *hook* change
+ * (next_hook/move_hook_up — advancing the hook and restyling it are kept mutually exclusive per
+ * round so their effects stay attributable); `fit_segments` contributions from every source
+ * (rule-based framing failures and a vision `fit_layout` improvement) are merged into one entry
+ * covering their union, and loudness/true_peak (`remaster`) always combines freely with anything
+ * else in the batch (it costs nothing extra: a re-render already remasters as its last step; see
+ * applyFixPlan).
+ *
+ * Rule-based fixes (loudness/true_peak, clean_ending, hook_matches, framing, dead_air) are
+ * considered first, in the order task-13-brief.md lists them, ahead of vision-driven ones. Every
+ * candidate fix is feasibility-checked here (not just planned and later declined by the caller) —
+ * an infeasible one (no next sentence to extend/trim to, would blow the duration bounds, no next
+ * hook variant to advance to) is simply left out, so a still-feasible candidate later in priority
+ * order (rule-based or vision) is not starved by it. `vision.overlaysCoverFace` (or an explicit
  * `move_hook_up` improvement) maps to a style change moving the hook overlay clear of the
  * speaker's face, ahead of the other vision improvements (Task 13 fix round 1) — unless
- * `ctx.style` is already `'hook-high'`, in which case that fix is skipped (it would be a no-op
- * re-render) and falls through like any other infeasible candidate (Task 13 fix round 2). Returns
- * null only when nothing left is fixable (QC then finalizes as-is). Pure.
+ * `ctx.style` is already `'hook-high'` (Task 13 fix round 2) or the hook slot in this round's
+ * batch is already taken. `loosen_pauses` is left out once `ctx.qcFixHistory` already contains it
+ * (it has one fixed level, so re-issuing it is always a no-op — QC-loop efficiency fix); a
+ * `fit_segments` contribution is filtered down to `ctx.allNonFitSegments` so segments a previous
+ * round already switched to 'fit' are never re-targeted. Returns `[]` only when nothing is left to
+ * fix (QC then finalizes as-is). Pure.
  */
-export function planFix(checks: QcCheck[], measures: Measures, vision: VisionCritique | null, ctx: FixCtx): FixPlan | null {
+export function planFix(checks: QcCheck[], measures: Measures, vision: VisionCritique | null, ctx: FixCtx): FixPlan[] {
   const failing = (name: string) => checks.some((c) => c.name === name && !c.ok);
+  const plans: FixPlan[] = [];
+  let boundaryPicked = false;
+  let hookPicked = false;
+  const fitSegmentsAcc = new Set<number>();
+  const fitSegmentsReasons: string[] = [];
+
+  const addFitSegments = (segments: number[], reason: string): void => {
+    const kept = segments.filter((s) => ctx.allNonFitSegments.includes(s));
+    if (kept.length === 0) return;
+    for (const s of kept) fitSegmentsAcc.add(s);
+    fitSegmentsReasons.push(reason);
+  };
 
   if (failing('loudness') || failing('true_peak')) {
-    return { kind: 'remaster', reason: 'loudness/true_peak out of spec' };
+    plans.push({ kind: 'remaster', reason: 'loudness/true_peak out of spec' });
   }
-  if (failing('clean_ending')) {
+  if (!boundaryPicked && failing('clean_ending')) {
     const newEnd = feasibleExtendEnd(ctx);
-    if (newEnd !== null) return { kind: 'extend_end', newEnd, reason: 'clean_ending failed' };
+    if (newEnd !== null) {
+      plans.push({ kind: 'extend_end', newEnd, reason: 'clean_ending failed' });
+      boundaryPicked = true;
+    }
   }
-  if (failing('hook_matches') && ctx.hookIndex + 1 < ctx.hookCount) {
-    return { kind: 'next_hook', reason: 'hook_matches failed' };
+  if (!hookPicked && failing('hook_matches') && ctx.hookIndex + 1 < ctx.hookCount) {
+    plans.push({ kind: 'next_hook', reason: 'hook_matches failed' });
+    hookPicked = true;
   }
   if (failing('framing')) {
     const segments = measures.faceChecks.filter((f) => !f.ok).map((f) => f.segment);
-    if (segments.length > 0) return { kind: 'fit_segments', segments, reason: 'framing failed' };
+    addFitSegments(segments, 'framing failed');
   }
-  if (failing('dead_air')) {
-    return { kind: 'loosen_pauses', reason: 'dead_air failed' };
+  if (failing('dead_air') && !ctx.qcFixHistory.includes('loosen_pauses')) {
+    plans.push({ kind: 'loosen_pauses', reason: 'dead_air failed' });
   }
 
   if (vision && vision.verdict !== 'keep') {
     const styleAlreadyHookHigh = ctx.style === 'hook-high';
-    if (vision.overlaysCoverFace && !styleAlreadyHookHigh) {
-      return { kind: 'move_hook_up', reason: 'vision: overlays cover face' };
+    if (!hookPicked && vision.overlaysCoverFace && !styleAlreadyHookHigh) {
+      plans.push({ kind: 'move_hook_up', reason: 'vision: overlays cover face' });
+      hookPicked = true;
     }
     for (const improvement of vision.improvements) {
       if (improvement === 'fit_layout') {
         const failingFace = measures.faceChecks.filter((f) => !f.ok).map((f) => f.segment);
         const segments = failingFace.length > 0 ? failingFace : ctx.allNonFitSegments;
-        if (segments.length > 0) return { kind: 'fit_segments', segments, reason: 'vision: fit_layout' };
+        addFitSegments(segments, 'vision: fit_layout');
       } else if (improvement === 'next_hook') {
-        if (ctx.hookIndex + 1 < ctx.hookCount) return { kind: 'next_hook', reason: 'vision: next_hook' };
+        if (!hookPicked && ctx.hookIndex + 1 < ctx.hookCount) {
+          plans.push({ kind: 'next_hook', reason: 'vision: next_hook' });
+          hookPicked = true;
+        }
       } else if (improvement === 'extend_end') {
-        const newEnd = feasibleExtendEnd(ctx);
-        if (newEnd !== null) return { kind: 'extend_end', newEnd, reason: 'vision: extend_end' };
+        if (!boundaryPicked) {
+          const newEnd = feasibleExtendEnd(ctx);
+          if (newEnd !== null) {
+            plans.push({ kind: 'extend_end', newEnd, reason: 'vision: extend_end' });
+            boundaryPicked = true;
+          }
+        }
       } else if (improvement === 'trim_start') {
-        const newStart = feasibleTrimStart(ctx);
-        if (newStart !== null) return { kind: 'trim_start', newStart, reason: 'vision: trim_start' };
+        if (!boundaryPicked) {
+          const newStart = feasibleTrimStart(ctx);
+          if (newStart !== null) {
+            plans.push({ kind: 'trim_start', newStart, reason: 'vision: trim_start' });
+            boundaryPicked = true;
+          }
+        }
       } else if (improvement === 'move_hook_up') {
-        if (!styleAlreadyHookHigh) return { kind: 'move_hook_up', reason: 'vision: move_hook_up' };
-        // else: already applied — fall through to the next improvement, if any (same as every
-        // other infeasible candidate above).
+        if (!hookPicked && !styleAlreadyHookHigh) {
+          plans.push({ kind: 'move_hook_up', reason: 'vision: move_hook_up' });
+          hookPicked = true;
+        }
+        // else: already applied, or the hook slot is already taken this round — fall through to
+        // the next improvement, if any (same as every other infeasible/skipped candidate above).
       }
     }
   }
 
-  return null;
+  if (fitSegmentsAcc.size > 0) {
+    const segments = [...fitSegmentsAcc].sort((a, b) => a - b);
+    plans.push({ kind: 'fit_segments', segments, reason: fitSegmentsReasons.join('; ') });
+  }
+
+  return plans;
 }
 
 // ---- Sentence-boundary helpers for extend_end / trim_start fixes ----

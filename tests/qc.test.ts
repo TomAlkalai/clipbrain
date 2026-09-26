@@ -227,14 +227,23 @@ const CTX: FixCtx = {
   minSec: 2,
   maxSec: 10,
   sentences: SENTENCES,
+  qcFixHistory: [],
 };
 const OK_MEASURES = PASSING;
 
-it('planFix: loudness failure plans a remaster, ahead of any vision fix', () => {
+// planFix now returns the FULL batch of compatible, feasible fixes for the round (QC-loop
+// efficiency fix, 2026-09-26) instead of a single `FixPlan | null` — see rules.ts's own doc
+// comment for the compatibility rules (at most one boundary change, at most one hook change,
+// fit_segments/loosen_pauses/remaster combine freely with everything).
+
+it('planFix: loudness failure plans a remaster; a compatible vision fit_layout batches alongside it', () => {
   const checks = evaluate({ ...PASSING, loudness: { i: -20, tp: -1 } }, EXPECTED_DURATION);
   const v: VisionCritique = { ...KEEP, verdict: 'reject', improvements: ['fit_layout'] };
-  const plan = planFix(checks, PASSING, v, CTX);
-  expect(plan).toEqual({ kind: 'remaster', reason: 'loudness/true_peak out of spec' });
+  const plans = planFix(checks, PASSING, v, CTX);
+  expect(plans).toEqual([
+    { kind: 'remaster', reason: 'loudness/true_peak out of spec' },
+    { kind: 'fit_segments', segments: CTX.allNonFitSegments, reason: 'vision: fit_layout' },
+  ]);
 });
 
 it('planFix: framing failure with failing segments plans fit_segments for exactly those segments', () => {
@@ -247,29 +256,57 @@ it('planFix: framing failure with failing segments plans fit_segments for exactl
     ],
   };
   const checks = evaluate(measures, EXPECTED_DURATION);
-  const plan = planFix(checks, measures, null, CTX);
-  expect(plan).toEqual({ kind: 'fit_segments', segments: [0, 2], reason: 'framing failed' });
+  const plans = planFix(checks, measures, null, CTX);
+  expect(plans).toEqual([{ kind: 'fit_segments', segments: [0, 2], reason: 'framing failed' }]);
+});
+
+it('planFix: fit_segments is filtered to allNonFitSegments — a segment already switched to fit is never re-targeted', () => {
+  // Batch fixes item 1: "fit_layout is skipped when those segments are already fit" — derived
+  // directly from ctx.allNonFitSegments (the clip's actual current layout state) rather than
+  // from history, so this holds regardless of which source (rule-based framing or vision
+  // fit_layout) proposed the now-stale segment index.
+  const measures: Measures = {
+    ...PASSING,
+    faceChecks: [
+      { segment: 0, ok: false },
+      { segment: 1, ok: true },
+      { segment: 2, ok: false },
+    ],
+  };
+  const checks = evaluate(measures, EXPECTED_DURATION);
+  const partlyFitCtx: FixCtx = { ...CTX, allNonFitSegments: [2] }; // segment 0 already fit
+  expect(planFix(checks, measures, null, partlyFitCtx)).toEqual([
+    { kind: 'fit_segments', segments: [2], reason: 'framing failed' },
+  ]);
 });
 
 it('planFix: hook_matches failure plans next_hook only when a next hook exists', () => {
   const checks = evaluate({ ...PASSING, content: { ...PASSING.content!, hookMatches: false } }, EXPECTED_DURATION);
-  expect(planFix(checks, PASSING, null, CTX)).toEqual({ kind: 'next_hook', reason: 'hook_matches failed' });
+  expect(planFix(checks, PASSING, null, CTX)).toEqual([{ kind: 'next_hook', reason: 'hook_matches failed' }]);
   const lastHookCtx: FixCtx = { ...CTX, hookIndex: 1, hookCount: 2 };
-  // no next hook available -> falls through to null (no other failures, no vision)
-  expect(planFix(checks, PASSING, null, lastHookCtx)).toBeNull();
+  // no next hook available -> falls through to [] (no other failures, no vision)
+  expect(planFix(checks, PASSING, null, lastHookCtx)).toEqual([]);
 });
 
 it('planFix: dead_air failure plans loosen_pauses', () => {
   const checks = evaluate({ ...PASSING, silences: [{ start: 1, end: 3 }] }, EXPECTED_DURATION);
-  expect(planFix(checks, PASSING, null, CTX)).toEqual({ kind: 'loosen_pauses', reason: 'dead_air failed' });
+  expect(planFix(checks, PASSING, null, CTX)).toEqual([{ kind: 'loosen_pauses', reason: 'dead_air failed' }]);
+});
+
+it('planFix: loosen_pauses is skipped once already in qcFixHistory — it has one fixed level, so a second attempt would be a no-op re-render', () => {
+  // Batch fixes item 1 / debug-dead-air.md: "planFix re-applied loosen_pauses with the same
+  // maxPause 0.3 (no change), wasting a full re-render."
+  const checks = evaluate({ ...PASSING, silences: [{ start: 1, end: 3 }] }, EXPECTED_DURATION);
+  const alreadyLoosenedCtx: FixCtx = { ...CTX, qcFixHistory: ['loosen_pauses'] };
+  expect(planFix(checks, PASSING, null, alreadyLoosenedCtx)).toEqual([]);
 });
 
 it('planFix: clean_ending failure plans extend_end with the computed, already-feasible newEnd', () => {
   const checks = evaluate({ ...PASSING, content: { ...PASSING.content!, cleanEnding: false } }, EXPECTED_DURATION);
-  expect(planFix(checks, PASSING, null, CTX)).toEqual({ kind: 'extend_end', newEnd: 9, reason: 'clean_ending failed' });
+  expect(planFix(checks, PASSING, null, CTX)).toEqual([{ kind: 'extend_end', newEnd: 9, reason: 'clean_ending failed' }]);
 });
 
-it('planFix: an infeasible clean_ending fix (extension exceeds maxSec*1.15) falls through to dead_air, not null', () => {
+it('planFix: an infeasible clean_ending fix (extension exceeds maxSec*1.15) falls through to dead_air, not []', () => {
   // Fix round 1, item 2: previously planFix returned extend_end unconditionally here and
   // applyFixPlan silently declined it, forfeiting the still-fixable dead_air failure.
   const checks = evaluate(
@@ -277,19 +314,31 @@ it('planFix: an infeasible clean_ending fix (extension exceeds maxSec*1.15) fall
     EXPECTED_DURATION,
   );
   const tinyMaxSecCtx: FixCtx = { ...CTX, maxSec: 1 }; // newEnd=9, duration=9 >> 1*1.15 -> infeasible
-  expect(planFix(checks, PASSING, null, tinyMaxSecCtx)).toEqual({ kind: 'loosen_pauses', reason: 'dead_air failed' });
+  expect(planFix(checks, PASSING, null, tinyMaxSecCtx)).toEqual([{ kind: 'loosen_pauses', reason: 'dead_air failed' }]);
 });
 
-it('planFix: clean_ending infeasible AND no other rule/vision failure -> null (not extend_end)', () => {
+it('planFix: clean_ending infeasible AND no other rule/vision failure -> [] (not extend_end)', () => {
   const checks = evaluate({ ...PASSING, content: { ...PASSING.content!, cleanEnding: false } }, EXPECTED_DURATION);
   const tinyMaxSecCtx: FixCtx = { ...CTX, maxSec: 1 };
-  expect(planFix(checks, PASSING, null, tinyMaxSecCtx)).toBeNull();
+  expect(planFix(checks, PASSING, null, tinyMaxSecCtx)).toEqual([]);
 });
 
 it('planFix: clean_ending fix is infeasible when there is no later sentence at all', () => {
   const checks = evaluate({ ...PASSING, content: { ...PASSING.content!, cleanEnding: false } }, EXPECTED_DURATION);
   const noLaterSentenceCtx: FixCtx = { ...CTX, end: 9 }; // 9 is the last sentence's own end
-  expect(planFix(checks, PASSING, null, noLaterSentenceCtx)).toBeNull();
+  expect(planFix(checks, PASSING, null, noLaterSentenceCtx)).toEqual([]);
+});
+
+it('planFix: at most one boundary change per round — rule-based extend_end wins over a simultaneous vision trim_start', () => {
+  const checks = evaluate({ ...PASSING, content: { ...PASSING.content!, cleanEnding: false } }, EXPECTED_DURATION);
+  const v: VisionCritique = { ...KEEP, verdict: 'improve', improvements: ['trim_start'] };
+  expect(planFix(checks, PASSING, v, CTX)).toEqual([{ kind: 'extend_end', newEnd: 9, reason: 'clean_ending failed' }]);
+});
+
+it('planFix: at most one hook change per round — rule-based next_hook wins over a simultaneous vision overlaysCoverFace', () => {
+  const checks = evaluate({ ...PASSING, content: { ...PASSING.content!, hookMatches: false } }, EXPECTED_DURATION);
+  const v: VisionCritique = { ...KEEP, verdict: 'improve', overlaysCoverFace: true };
+  expect(planFix(checks, PASSING, v, CTX)).toEqual([{ kind: 'next_hook', reason: 'hook_matches failed' }]);
 });
 
 it('planFix: all rule checks pass + vision reject with fit_layout uses faceChecks failures when present', () => {
@@ -303,83 +352,103 @@ it('planFix: all rule checks pass + vision reject with fit_layout uses faceCheck
   };
   const checks = evaluate(measures, EXPECTED_DURATION); // framing still passes (2/3 = 66% >= 60%)
   const v: VisionCritique = { ...KEEP, verdict: 'improve', improvements: ['fit_layout'] };
-  const plan = planFix(checks, measures, v, CTX);
-  expect(plan).toEqual({ kind: 'fit_segments', segments: [2], reason: 'vision: fit_layout' });
+  const plans = planFix(checks, measures, v, CTX);
+  expect(plans).toEqual([{ kind: 'fit_segments', segments: [2], reason: 'vision: fit_layout' }]);
 });
 
 it('planFix: vision fit_layout falls back to allNonFitSegments when no faceChecks are failing', () => {
   const checks = evaluate(OK_MEASURES, EXPECTED_DURATION);
   const v: VisionCritique = { ...KEEP, verdict: 'improve', improvements: ['fit_layout'] };
-  const plan = planFix(checks, OK_MEASURES, v, CTX);
-  expect(plan).toEqual({ kind: 'fit_segments', segments: CTX.allNonFitSegments, reason: 'vision: fit_layout' });
+  const plans = planFix(checks, OK_MEASURES, v, CTX);
+  expect(plans).toEqual([{ kind: 'fit_segments', segments: CTX.allNonFitSegments, reason: 'vision: fit_layout' }]);
 });
 
 it('planFix: vision next_hook is skipped (falls through) when there is no next hook, tries the next improvement', () => {
   const checks = evaluate(OK_MEASURES, EXPECTED_DURATION);
   const v: VisionCritique = { ...KEEP, verdict: 'improve', improvements: ['next_hook', 'extend_end'] };
   const noNextHookCtx: FixCtx = { ...CTX, hookIndex: 1, hookCount: 2 };
-  const plan = planFix(checks, OK_MEASURES, v, noNextHookCtx);
-  expect(plan).toEqual({ kind: 'extend_end', newEnd: 9, reason: 'vision: extend_end' });
+  const plans = planFix(checks, OK_MEASURES, v, noNextHookCtx);
+  expect(plans).toEqual([{ kind: 'extend_end', newEnd: 9, reason: 'vision: extend_end' }]);
 });
 
 it('planFix: vision extend_end also falls through (to trim_start) when infeasible', () => {
   const checks = evaluate(OK_MEASURES, EXPECTED_DURATION);
   const v: VisionCritique = { ...KEEP, verdict: 'improve', improvements: ['extend_end', 'trim_start'] };
   const tinyMaxSecCtx: FixCtx = { ...CTX, maxSec: 1 };
-  expect(planFix(checks, OK_MEASURES, v, tinyMaxSecCtx)).toEqual({ kind: 'trim_start', newStart: 2, reason: 'vision: trim_start' });
+  expect(planFix(checks, OK_MEASURES, v, tinyMaxSecCtx)).toEqual([{ kind: 'trim_start', newStart: 2, reason: 'vision: trim_start' }]);
 });
 
 it('planFix: vision trim_start maps directly to a trim_start plan (with its computed newStart)', () => {
   const checks = evaluate(OK_MEASURES, EXPECTED_DURATION);
   const v: VisionCritique = { ...KEEP, verdict: 'reject', improvements: ['trim_start'] };
-  expect(planFix(checks, OK_MEASURES, v, CTX)).toEqual({ kind: 'trim_start', newStart: 2, reason: 'vision: trim_start' });
+  expect(planFix(checks, OK_MEASURES, v, CTX)).toEqual([{ kind: 'trim_start', newStart: 2, reason: 'vision: trim_start' }]);
 });
 
 // ---- move_hook_up mapping (fix round 1, item 5) ----
 
-it('planFix: vision overlaysCoverFace=true maps to move_hook_up, ahead of the improvements list', () => {
+it('planFix: vision overlaysCoverFace=true maps to move_hook_up, and a compatible fit_layout batches alongside it', () => {
   const checks = evaluate(OK_MEASURES, EXPECTED_DURATION);
   const v: VisionCritique = { ...KEEP, verdict: 'improve', overlaysCoverFace: true, improvements: ['fit_layout'] };
-  expect(planFix(checks, OK_MEASURES, v, CTX)).toEqual({ kind: 'move_hook_up', reason: 'vision: overlays cover face' });
+  expect(planFix(checks, OK_MEASURES, v, CTX)).toEqual([
+    { kind: 'move_hook_up', reason: 'vision: overlays cover face' },
+    { kind: 'fit_segments', segments: CTX.allNonFitSegments, reason: 'vision: fit_layout' },
+  ]);
 });
 
 it('planFix: an explicit move_hook_up improvement maps to move_hook_up even when overlaysCoverFace is false', () => {
   const checks = evaluate(OK_MEASURES, EXPECTED_DURATION);
   const v: VisionCritique = { ...KEEP, verdict: 'improve', overlaysCoverFace: false, improvements: ['move_hook_up'] };
-  expect(planFix(checks, OK_MEASURES, v, CTX)).toEqual({ kind: 'move_hook_up', reason: 'vision: move_hook_up' });
+  expect(planFix(checks, OK_MEASURES, v, CTX)).toEqual([{ kind: 'move_hook_up', reason: 'vision: move_hook_up' }]);
 });
 
-it('planFix: move_hook_up still yields to rule-based fixes (e.g. loudness) when both apply', () => {
+it('planFix: a rule-based remaster and a vision move_hook_up combine freely in the same batch (layout/pauses/remaster combine with anything)', () => {
   const checks = evaluate({ ...PASSING, loudness: { i: -20, tp: -1.2 } }, EXPECTED_DURATION);
   const v: VisionCritique = { ...KEEP, verdict: 'reject', overlaysCoverFace: true };
-  expect(planFix(checks, PASSING, v, CTX)).toEqual({ kind: 'remaster', reason: 'loudness/true_peak out of spec' });
+  expect(planFix(checks, PASSING, v, CTX)).toEqual([
+    { kind: 'remaster', reason: 'loudness/true_peak out of spec' },
+    { kind: 'move_hook_up', reason: 'vision: overlays cover face' },
+  ]);
 });
 
-it('planFix: move_hook_up is skipped once already applied (style already hook-high) — repeated overlaysCoverFace falls through to null', () => {
+it('planFix: move_hook_up is skipped once already applied (style already hook-high) — repeated overlaysCoverFace falls through to []', () => {
   // Fix round 2, item 1: previously this would re-plan (and re-render for) an identical,
   // no-op move_hook_up every round the vision critic repeated the same complaint.
   const checks = evaluate(OK_MEASURES, EXPECTED_DURATION);
   const alreadyHookHighCtx: FixCtx = { ...CTX, style: 'hook-high' };
   const v: VisionCritique = { ...KEEP, verdict: 'reject', overlaysCoverFace: true, improvements: ['move_hook_up'] };
-  expect(planFix(checks, OK_MEASURES, v, alreadyHookHighCtx)).toBeNull();
+  expect(planFix(checks, OK_MEASURES, v, alreadyHookHighCtx)).toEqual([]);
 });
 
-it('planFix: move_hook_up already applied falls through to the NEXT feasible vision improvement, not straight to null', () => {
+it('planFix: move_hook_up already applied falls through to the NEXT feasible vision improvement, not straight to []', () => {
   const checks = evaluate(OK_MEASURES, EXPECTED_DURATION);
   const alreadyHookHighCtx: FixCtx = { ...CTX, style: 'hook-high' };
   const v: VisionCritique = { ...KEEP, verdict: 'improve', overlaysCoverFace: true, improvements: ['move_hook_up', 'trim_start'] };
-  expect(planFix(checks, OK_MEASURES, v, alreadyHookHighCtx)).toEqual({ kind: 'trim_start', newStart: 2, reason: 'vision: trim_start' });
+  expect(planFix(checks, OK_MEASURES, v, alreadyHookHighCtx)).toEqual([{ kind: 'trim_start', newStart: 2, reason: 'vision: trim_start' }]);
 });
 
-it('planFix: nothing to fix (all pass, verdict keep) returns null', () => {
+it('planFix: nothing to fix (all pass, verdict keep) returns []', () => {
   const checks = evaluate(OK_MEASURES, EXPECTED_DURATION);
-  expect(planFix(checks, OK_MEASURES, KEEP, CTX)).toBeNull();
+  expect(planFix(checks, OK_MEASURES, KEEP, CTX)).toEqual([]);
 });
 
-it('planFix: reject verdict with an empty improvements list returns null (unfixable)', () => {
+it('planFix: reject verdict with an empty improvements list returns [] (unfixable)', () => {
   const checks = evaluate(OK_MEASURES, EXPECTED_DURATION);
   const v: VisionCritique = { ...KEEP, verdict: 'reject', improvements: [], reason: 'fundamentally broken' };
-  expect(planFix(checks, OK_MEASURES, v, CTX)).toBeNull();
+  expect(planFix(checks, OK_MEASURES, v, CTX)).toEqual([]);
+});
+
+// ---- Batch fixes (QC-loop efficiency, 2026-09-26): dead_air + vision fit_layout + ----
+// ---- overlaysCoverFace -> one plan with all three ----
+
+it('planFix: dead_air + vision overlaysCoverFace + vision fit_layout batch into ONE plan with all three (pauses/hook/layout all compatible)', () => {
+  const checks = evaluate({ ...PASSING, silences: [{ start: 1, end: 3 }] }, EXPECTED_DURATION);
+  const v: VisionCritique = { ...KEEP, verdict: 'improve', overlaysCoverFace: true, improvements: ['fit_layout'] };
+  const plans = planFix(checks, PASSING, v, CTX);
+  expect(plans).toEqual([
+    { kind: 'loosen_pauses', reason: 'dead_air failed' },
+    { kind: 'move_hook_up', reason: 'vision: overlays cover face' },
+    { kind: 'fit_segments', segments: CTX.allNonFitSegments, reason: 'vision: fit_layout' },
+  ]);
 });
 
 // ---- nextSentenceEnd / nextSentenceStart ----

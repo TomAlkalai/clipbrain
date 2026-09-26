@@ -74,6 +74,12 @@ export type Clip = {
   /** Remotion style name (remotion/style.ts STYLES key); defaults to 'default' when unset.
    * Set by QC's move_hook_up auto-fix ('hook-high') and read by produce.ts's rebuildEdl. */
   style?: string;
+  /** `FixPlan['kind']` values already applied to this clip across every QC run in its lifetime
+   * (not reset per qcClip() call) — lets planFix (qc/rules.ts) skip a fix that's already a no-op
+   * (e.g. loosen_pauses, which only has one level: maxPause 0.3) instead of paying for another
+   * identical re-render. See debug-dead-air.md ("planFix re-applied loosen_pauses with the same
+   * maxPause 0.3 — no change, wasting a full re-render"). */
+  qcFixHistory?: string[];
   /** Candidate context copied over by planClip (Task 14) — shown defensively in the review UI. */
   rank?: number;
   why?: string;

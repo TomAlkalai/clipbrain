@@ -358,53 +358,82 @@ export async function critiqueRenderSafe(clip: Clip): Promise<{ vision: VisionCr
 // ---- Auto-fix application (I/O) ----
 
 /**
- * Applies a `FixPlan` that `planFix` (rules.ts) has already feasibility-checked — `extend_end`/
- * `trim_start` carry their pre-computed, already-bounds-checked `newEnd`/`newStart`, so this
- * function has nothing left to validate and no reason to decline.
+ * Applies a whole round's batch of `FixPlan`s that `planFix` (rules.ts) has already
+ * feasibility-and-compatibility-checked (at most one boundary change, at most one hook change,
+ * `fit_segments` already merged into one entry) — `extend_end`/`trim_start` carry their
+ * pre-computed, already-bounds-checked `newEnd`/`newStart`, so this function has nothing left to
+ * validate and no reason to decline any of them.
+ *
+ * All the clip-mutating fixes (everything except a standalone `remaster`) are applied to `clip`
+ * first, then rebuilt/re-rendered with exactly ONE `rebuildEdl` + ONE `renderClip` call for the
+ * whole batch (QC-loop efficiency fix, 2026-09-26 — previously every fix cost its own ~12-16 min
+ * re-render). A `remaster` fix needs no re-render of its own: when it's the ONLY fix this round,
+ * `master()` re-masters `raw.mp4` directly (as before); when it accompanies a re-render-needing
+ * fix, it's folded into that one re-render for free (renderClip's own last step re-masters the
+ * fresh output anyway), so `master()` is never called twice.
+ *
+ * `clip.qcFixHistory` is extended with every applied fix's `kind` (deduped isn't needed — planFix
+ * only ever proposes `loosen_pauses` once it isn't already present) so a later QC round/run can
+ * skip a fix that's already a proven no-op.
  */
-async function applyFixPlan(plan: FixPlan, clip: Clip): Promise<string> {
+async function applyFixPlan(plans: FixPlan[], clip: Clip): Promise<string[]> {
   const dir = paths.clip(clip.id);
+  const remasterPlan = plans.find((p) => p.kind === 'remaster');
+  const rest = plans.filter((p): p is Exclude<FixPlan, { kind: 'remaster' }> => p.kind !== 'remaster');
 
-  switch (plan.kind) {
-    case 'remaster': {
-      await master(path.join(dir, 'raw.mp4'), path.join(dir, 'render.mp4'));
-      return `remastered audio (${plan.reason})`;
-    }
-    case 'fit_segments': {
-      await rebuildEdl(clip, { fitSegments: plan.segments });
-      await renderClip(clip.id);
-      return `set segment(s) [${plan.segments.join(', ')}] to fit layout (${plan.reason})`;
-    }
-    case 'next_hook': {
-      clip.hookIndex += 1;
-      await rebuildEdl(clip);
-      await renderClip(clip.id);
-      return `advanced hookIndex to ${clip.hookIndex} (${plan.reason})`;
-    }
-    case 'extend_end': {
-      clip.end = plan.newEnd;
-      await rebuildEdl(clip);
-      await renderClip(clip.id);
-      return `extended end to ${plan.newEnd.toFixed(2)}s (${plan.reason})`;
-    }
-    case 'trim_start': {
-      clip.start = plan.newStart;
-      await rebuildEdl(clip);
-      await renderClip(clip.id);
-      return `trimmed start to ${plan.newStart.toFixed(2)}s (${plan.reason})`;
-    }
-    case 'loosen_pauses': {
-      await rebuildEdl(clip, { maxPause: 0.3 });
-      await renderClip(clip.id);
-      return `loosened maxPause to 0.3s (${plan.reason})`;
-    }
-    case 'move_hook_up': {
-      clip.style = 'hook-high';
-      await rebuildEdl(clip);
-      await renderClip(clip.id);
-      return `switched style to hook-high (${plan.reason})`;
+  if (rest.length === 0) {
+    if (!remasterPlan) return [];
+    await master(path.join(dir, 'raw.mp4'), path.join(dir, 'render.mp4'));
+    clip.qcFixHistory = [...(clip.qcFixHistory ?? []), 'remaster'];
+    saveClip(clip);
+    return [`remastered audio (${remasterPlan.reason})`];
+  }
+
+  const descriptions: string[] = [];
+  let maxPauseOverride: number | undefined;
+  let fitSegmentsOverride: number[] | undefined;
+
+  for (const plan of rest) {
+    switch (plan.kind) {
+      case 'fit_segments':
+        fitSegmentsOverride = plan.segments;
+        descriptions.push(`set segment(s) [${plan.segments.join(', ')}] to fit layout (${plan.reason})`);
+        break;
+      case 'next_hook':
+        clip.hookIndex += 1;
+        descriptions.push(`advanced hookIndex to ${clip.hookIndex} (${plan.reason})`);
+        break;
+      case 'extend_end':
+        clip.end = plan.newEnd;
+        descriptions.push(`extended end to ${plan.newEnd.toFixed(2)}s (${plan.reason})`);
+        break;
+      case 'trim_start':
+        clip.start = plan.newStart;
+        descriptions.push(`trimmed start to ${plan.newStart.toFixed(2)}s (${plan.reason})`);
+        break;
+      case 'loosen_pauses':
+        maxPauseOverride = 0.3;
+        descriptions.push(`loosened maxPause to 0.3s (${plan.reason})`);
+        break;
+      case 'move_hook_up':
+        clip.style = 'hook-high';
+        descriptions.push(`switched style to hook-high (${plan.reason})`);
+        break;
     }
   }
+  if (remasterPlan) {
+    descriptions.push(`remastered audio via the same re-render (${remasterPlan.reason})`);
+  }
+
+  clip.qcFixHistory = [...(clip.qcFixHistory ?? []), ...plans.map((p) => p.kind)];
+
+  await rebuildEdl(clip, {
+    ...(maxPauseOverride !== undefined ? { maxPause: maxPauseOverride } : {}),
+    ...(fitSegmentsOverride ? { fitSegments: fitSegmentsOverride } : {}),
+  });
+  await renderClip(clip.id);
+
+  return descriptions;
 }
 
 const MAX_FIX_ROUNDS = 2;
@@ -461,7 +490,7 @@ export async function qcClip(clipId: string): Promise<QcReport> {
     if (ok || round >= MAX_FIX_ROUNDS) break;
 
     const allNonFitSegments = clip.edl!.segments.map((_, i) => i).filter((i) => clip.edl!.segments[i].layout.kind !== 'fit');
-    const plan = planFix(checks, measures, vision, {
+    const plans = planFix(checks, measures, vision, {
       hookIndex: clip.hookIndex,
       hookCount: clip.hooks.length,
       allNonFitSegments,
@@ -471,11 +500,13 @@ export async function qcClip(clipId: string): Promise<QcReport> {
       maxSec: bounds.maxSec,
       sentences,
       style: clip.style ?? 'default',
+      qcFixHistory: clip.qcFixHistory ?? [],
     });
-    if (!plan) break;
+    if (plans.length === 0) break;
 
-    const applied = await applyFixPlan(plan, clip);
-    fixesApplied.push(applied);
+    const applied = await applyFixPlan(plans, clip);
+    if (applied.length === 0) break; // every planned fix turned out to be a no-op (shouldn't normally happen)
+    fixesApplied.push(...applied);
     clip = loadClip(clipId); // pick up whatever renderClip/rebuildEdl/master persisted
   }
 
