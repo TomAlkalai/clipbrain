@@ -18,6 +18,7 @@ import { generateHooks } from './hooks/hooks.js';
 import { buildEdl } from './edit/edl.js';
 import { ensureHires, renderClip, truncateEdl } from './render/render.js';
 import { qcClip } from './qc/qc.js';
+import { createReviewServer } from './review/server.js';
 import { authorize } from './publish/oauth.js';
 import { publish } from './publish/youtube.js';
 import { collectStats, importCsv } from './metrics/stats.js';
@@ -547,6 +548,15 @@ export const commands: Record<string, { help: string; run: (a: ParsedArgs) => Pr
       }
 
       console.log(`\nverdict: ${report.ok ? 'READY' : 'QC_FAILED'}  (${elapsed}s)`);
+    },
+  },
+  review: {
+    help: 'review [--port 4777] — start the local human-in-the-loop review server (approve/reject/hook re-render UI).',
+    async run(a) {
+      setBackend(claudeBackend); // the hook-switch job runner's qcClip/renderClip path needs an LLM backend
+      const port = Number(asString(a.flags.port) ?? 4777) || 4777;
+      const server = await createReviewServer({ port });
+      log(`review server listening at ${server.url}`);
     },
   },
   auth: {

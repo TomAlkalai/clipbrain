@@ -31,6 +31,70 @@ function resolveSafe(root: string, urlPath: string): string | null {
 }
 
 /**
+ * Resolves `relPath` safely against `root` (refusing anything that would escape it) and serves it
+ * over `res`, with byte-range support (required for `<video>`/`OffthreadVideo` seeking). Shared by
+ * `startStaticServer` (Remotion's hi-res/EDL feed) and the review server's `/media/clips/...`
+ * route — both need the exact same safe-resolution + range-handling logic, so this is the one
+ * place it lives.
+ */
+export function serveFile(req: http.IncomingMessage, res: http.ServerResponse, root: string, relPath: string): void {
+  const absRoot = path.resolve(root);
+  const filePath = resolveSafe(absRoot, relPath);
+  if (!filePath) {
+    res.writeHead(400, { 'Content-Type': 'text/plain' });
+    res.end('bad path');
+    return;
+  }
+
+  let stat: fs.Stats;
+  try {
+    stat = fs.statSync(filePath);
+  } catch {
+    res.writeHead(404, { 'Content-Type': 'text/plain' });
+    res.end('not found');
+    return;
+  }
+  if (!stat.isFile()) {
+    res.writeHead(404, { 'Content-Type': 'text/plain' });
+    res.end('not found');
+    return;
+  }
+
+  const contentType = contentTypeFor(filePath);
+  const range = req.headers.range;
+  if (range) {
+    const m = /^bytes=(\d*)-(\d*)$/.exec(range.trim());
+    if (!m || (m[1] === '' && m[2] === '')) {
+      res.writeHead(416, { 'Content-Range': `bytes */${stat.size}` });
+      res.end();
+      return;
+    }
+    const start = m[1] === '' ? Math.max(0, stat.size - Number(m[2])) : Number(m[1]);
+    const end = m[2] === '' ? stat.size - 1 : Math.min(Number(m[2]), stat.size - 1);
+    if (Number.isNaN(start) || Number.isNaN(end) || start > end || start >= stat.size) {
+      res.writeHead(416, { 'Content-Range': `bytes */${stat.size}` });
+      res.end();
+      return;
+    }
+    res.writeHead(206, {
+      'Content-Type': contentType,
+      'Content-Range': `bytes ${start}-${end}/${stat.size}`,
+      'Content-Length': end - start + 1,
+      'Accept-Ranges': 'bytes',
+    });
+    fs.createReadStream(filePath, { start, end }).pipe(res);
+    return;
+  }
+
+  res.writeHead(200, {
+    'Content-Type': contentType,
+    'Content-Length': stat.size,
+    'Accept-Ranges': 'bytes',
+  });
+  fs.createReadStream(filePath).pipe(res);
+}
+
+/**
  * A minimal static file server for feeding hi-res video + EDL JSON to the Remotion renderer's
  * headless Chrome (which fetches over HTTP, not file://). Binds to 127.0.0.1 on a random free
  * port, serves only files under `root`, and supports byte-range requests (required for
@@ -40,59 +104,7 @@ export function startStaticServer(root: string): Promise<{ url: string; close: (
   const absRoot = path.resolve(root);
 
   const server = http.createServer((req, res) => {
-    const filePath = resolveSafe(absRoot, req.url ?? '/');
-    if (!filePath) {
-      res.writeHead(400, { 'Content-Type': 'text/plain' });
-      res.end('bad path');
-      return;
-    }
-
-    let stat: fs.Stats;
-    try {
-      stat = fs.statSync(filePath);
-    } catch {
-      res.writeHead(404, { 'Content-Type': 'text/plain' });
-      res.end('not found');
-      return;
-    }
-    if (!stat.isFile()) {
-      res.writeHead(404, { 'Content-Type': 'text/plain' });
-      res.end('not found');
-      return;
-    }
-
-    const contentType = contentTypeFor(filePath);
-    const range = req.headers.range;
-    if (range) {
-      const m = /^bytes=(\d*)-(\d*)$/.exec(range.trim());
-      if (!m || (m[1] === '' && m[2] === '')) {
-        res.writeHead(416, { 'Content-Range': `bytes */${stat.size}` });
-        res.end();
-        return;
-      }
-      const start = m[1] === '' ? Math.max(0, stat.size - Number(m[2])) : Number(m[1]);
-      const end = m[2] === '' ? stat.size - 1 : Math.min(Number(m[2]), stat.size - 1);
-      if (Number.isNaN(start) || Number.isNaN(end) || start > end || start >= stat.size) {
-        res.writeHead(416, { 'Content-Range': `bytes */${stat.size}` });
-        res.end();
-        return;
-      }
-      res.writeHead(206, {
-        'Content-Type': contentType,
-        'Content-Range': `bytes ${start}-${end}/${stat.size}`,
-        'Content-Length': end - start + 1,
-        'Accept-Ranges': 'bytes',
-      });
-      fs.createReadStream(filePath, { start, end }).pipe(res);
-      return;
-    }
-
-    res.writeHead(200, {
-      'Content-Type': contentType,
-      'Content-Length': stat.size,
-      'Accept-Ranges': 'bytes',
-    });
-    fs.createReadStream(filePath).pipe(res);
+    serveFile(req, res, absRoot, req.url ?? '/');
   });
 
   return new Promise((resolve, reject) => {
