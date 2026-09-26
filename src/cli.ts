@@ -18,7 +18,7 @@ import { generateHooks } from './hooks/hooks.js';
 import { buildEdl } from './edit/edl.js';
 import { ensureHires, renderClip, truncateEdl } from './render/render.js';
 import { qcClip } from './qc/qc.js';
-import { produceSource, runPipeline, scout } from './produce.js';
+import { produceSource, requalifyClip, requalifySource, runPipeline, scout } from './produce.js';
 import { evalSource } from './eval.js';
 import { createReviewServer } from './review/server.js';
 import { authorize } from './publish/oauth.js';
@@ -575,6 +575,38 @@ export const commands: Record<string, { help: string; run: (a: ParsedArgs) => Pr
         console.log(c.id.padEnd(14), c.status.padEnd(11), dur.padEnd(8), c.composite.toFixed(2).padEnd(10), hook);
       }
       log(`produce ${sourceId}: ${clips.length} clip(s) in ${elapsed}s`);
+    },
+  },
+  requalify: {
+    help:
+      'requalify <clipId> | requalify --source <sourceId> [--status qc_failed] — rebuild the EDL with the current code and re-run render+QC for a clip (or every clip of a source in the given status, default qc_failed).',
+    async run(a) {
+      setBackend(claudeBackend);
+      const clipId = a._[0];
+      const sourceId = asString(a.flags.source);
+      const status = (asString(a.flags.status) ?? 'qc_failed') as ClipStatus;
+
+      let clips: Clip[];
+      if (clipId) {
+        clips = [await requalifyClip(clipId)];
+      } else if (sourceId) {
+        clips = await requalifySource(sourceId, status);
+        if (clips.length === 0) {
+          log(`requalify ${sourceId}: no clips with status=${status}`);
+          return;
+        }
+      } else {
+        log('usage: cb requalify <clipId> | cb requalify --source <sourceId> [--status qc_failed]');
+        process.exitCode = 1;
+        return;
+      }
+
+      console.log('id'.padEnd(14), 'status'.padEnd(11), 'dur'.padEnd(8), 'composite'.padEnd(10), 'hook');
+      for (const c of clips) {
+        const dur = c.edl ? `${c.edl.durationSec.toFixed(1)}s` : '-';
+        const hook = c.error ? `ERROR: ${c.error}` : (c.hooks[c.hookIndex]?.text ?? '(no hook)');
+        console.log(c.id.padEnd(14), c.status.padEnd(11), dur.padEnd(8), c.composite.toFixed(2).padEnd(10), hook);
+      }
     },
   },
   run: {

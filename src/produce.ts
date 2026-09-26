@@ -13,7 +13,7 @@ import { listChannel } from './yt/ytdlp.js';
 import { mmss } from './select/propose.js';
 import { ledgerSummary } from './llm/llm.js';
 import { log, step } from './log.js';
-import type { Clip, Word, Shot, FaceSample, Source, Creator, Candidate, Sentence, RefShort, Silence } from './types.js';
+import type { Clip, ClipStatus, Word, Shot, FaceSample, Source, Creator, Candidate, Sentence, RefShort, Silence } from './types.js';
 
 // Task 14: hooks -> edl -> render -> qc orchestration for shortlisted candidates, plus the
 // run/eval/scout entry points. `rebuildEdl` (below) predates this — it was needed by Task 13's
@@ -130,19 +130,49 @@ export async function rebuildEdl(clip: Clip, overrides?: { maxPause?: number; fi
 }
 
 /**
- * For each shortlisted candidate (by rank) that doesn't already have a clip — matched by
- * `candidateId` against every existing clip for this source, regardless of status, so a re-run
- * after a partial failure never re-produces a clip that already exists — runs: hooks -> planClip
- * -> save -> ensureHires -> rebuildEdl -> renderClip -> qcClip. Sequential, not parallel:
- * rendering is CPU-bound (Remotion + ffmpeg), so producing candidates concurrently would just
- * contend for the same cores rather than finishing faster.
- *
- * Each clip is processed in its own try/catch: on error, the clip (if `planClip` already ran)
- * gets `clip.error = message` and is saved as-is, and the loop continues to the next candidate
- * rather than aborting the whole run. `o.limit`, when given, caps how many *new* clips this call
- * produces (candidates already skipped for having a clip don't count against it).
+ * The pipeline stage functions `produceSource` calls, as an injectable seam for tests (real
+ * production I/O — hi-res fetch, Remotion render, LLM calls — is far too slow/expensive to
+ * exercise in a unit test). Defaults to the real implementations; a caller (or a test) can
+ * override any subset via `produceSource`'s `o.deps`.
  */
-export async function produceSource(sourceId: string, o?: { limit?: number }): Promise<Clip[]> {
+export type ProduceDeps = {
+  generateHooks: typeof generateHooks;
+  ensureHires: typeof ensureHires;
+  rebuildEdl: typeof rebuildEdl;
+  renderClip: typeof renderClip;
+  qcClip: typeof qcClip;
+};
+
+const defaultProduceDeps: ProduceDeps = { generateHooks, ensureHires, rebuildEdl, renderClip, qcClip };
+
+/** A clip in one of these statuses is finished (successfully or not) — produceSource never
+ * touches it again. Anything else (`planned`, `rendered`) is resumable. */
+const TERMINAL_CLIP_STATUSES: ReadonlySet<ClipStatus> = new Set(['ready', 'qc_failed', 'approved', 'rejected', 'published']);
+
+/**
+ * For each shortlisted candidate (by rank), matched by `candidateId` against every existing clip
+ * for this source:
+ *   - no clip yet: hooks -> planClip -> save, then falls into the `planned` case below.
+ *   - clip.status is `planned` or `rendered` (non-terminal — RESUMED from its last completed
+ *     stage, once per call, whether or not `clip.error` is set from a prior failed attempt):
+ *       - `planned`  -> ensureHires -> rebuildEdl -> renderClip -> qcClip (nothing durable yet).
+ *       - `rendered` -> qcClip only (the render already succeeded).
+ *   - clip.status is terminal (`ready`, `qc_failed`, `approved`, `rejected`, `published`):
+ *     skipped — already finished, one way or another.
+ * Sequential, not parallel: rendering is CPU-bound (Remotion + ffmpeg), so producing candidates
+ * concurrently would just contend for the same cores rather than finishing faster.
+ *
+ * Each candidate is processed in its own try/catch: on error, the clip (if one exists on disk —
+ * either just planned, or resumed) gets `clip.error = message` and is saved as-is. If hook
+ * generation itself failed (no clip was ever created), the candidate still appears in the
+ * returned results with the error — as an unsaved, synthetic Clip (never written via `saveClip`,
+ * so the next `produceSource` call retries it fresh) — rather than vanishing silently. Either way
+ * the loop continues to the next candidate rather than aborting the whole run. `o.limit`, when
+ * given, caps how many candidates this call *works on* this call (skipped/terminal candidates
+ * don't count against it; a resumed one does, same as a freshly-created one).
+ */
+export async function produceSource(sourceId: string, o?: { limit?: number; deps?: Partial<ProduceDeps> }): Promise<Clip[]> {
+  const deps: ProduceDeps = { ...defaultProduceDeps, ...o?.deps };
   const dir = paths.source(sourceId);
   const source = loadSource(sourceId);
   const creator = loadCreator(source.creator);
@@ -151,43 +181,57 @@ export async function produceSource(sourceId: string, o?: { limit?: number }): P
   const candidates = readJson<Candidate[]>(path.join(dir, 'candidates.json'));
   const shortlisted = candidates.filter((c) => c.shortlisted).sort((a, b) => (a.rank ?? 0) - (b.rank ?? 0));
 
-  const existingCandidateIds = new Set(listClips((c) => c.sourceId === sourceId).map((c) => c.candidateId));
+  const existingByCandidateId = new Map(listClips((c) => c.sourceId === sourceId).map((c) => [c.candidateId, c]));
 
   const results: Clip[] = [];
   let produced = 0;
   for (const cand of shortlisted) {
-    if (existingCandidateIds.has(cand.id)) continue;
+    const existing = existingByCandidateId.get(cand.id);
+    if (existing && TERMINAL_CLIP_STATUSES.has(existing.status)) continue;
     if (o?.limit !== undefined && produced >= o.limit) break;
     produced++;
 
-    let clip: Clip | undefined;
+    let clip: Clip | undefined = existing;
     try {
-      const gen = await generateHooks({
-        creatorName: creator.name,
-        episodeTitle: source.title,
-        pb,
-        sentences,
-        startSid: cand.startSid,
-        endSid: cand.endSid,
-        candidateTitle: cand.title,
-        summary: cand.summary,
-      });
-      clip = planClip(source, creator, cand, gen, sentences);
-      saveClip(clip);
+      if (!clip) {
+        const gen = await deps.generateHooks({
+          creatorName: creator.name,
+          episodeTitle: source.title,
+          pb,
+          sentences,
+          startSid: cand.startSid,
+          endSid: cand.endSid,
+          candidateTitle: cand.title,
+          summary: cand.summary,
+        });
+        clip = planClip(source, creator, cand, gen, sentences);
+        saveClip(clip);
+      } else if (clip.error) {
+        // Resuming after a prior failed attempt — clear the stale error so a successful resume
+        // doesn't leave it lingering on the clip.
+        delete clip.error;
+        saveClip(clip);
+      }
 
-      const doneHires = step(`produceSource ${sourceId}: ensureHires (${clip.id}, rank ${cand.rank})`);
-      await ensureHires(clip, source);
-      doneHires();
+      if (clip.status === 'planned') {
+        const doneHires = step(`produceSource ${sourceId}: ensureHires (${clip.id}, rank ${cand.rank})`);
+        await deps.ensureHires(clip, source);
+        doneHires();
 
-      await rebuildEdl(clip);
+        await deps.rebuildEdl(clip);
 
-      const doneRender = step(`produceSource ${sourceId}: render (${clip.id})`);
-      await renderClip(clip.id);
-      doneRender();
+        const doneRender = step(`produceSource ${sourceId}: render (${clip.id})`);
+        await deps.renderClip(clip.id);
+        doneRender();
 
-      const doneQc = step(`produceSource ${sourceId}: qc (${clip.id})`);
-      await qcClip(clip.id);
-      doneQc();
+        const doneQc = step(`produceSource ${sourceId}: qc (${clip.id})`);
+        await deps.qcClip(clip.id);
+        doneQc();
+      } else if (clip.status === 'rendered') {
+        const doneQc = step(`produceSource ${sourceId}: qc (resumed, ${clip.id})`);
+        await deps.qcClip(clip.id);
+        doneQc();
+      }
 
       results.push(loadClip(clip.id));
     } catch (err) {
@@ -207,7 +251,90 @@ export async function produceSource(sourceId: string, o?: { limit?: number }): P
         onDisk.error = message;
         saveClip(onDisk);
         results.push(onDisk);
+      } else {
+        // Hook generation itself failed before any clip existed — nothing to load/save, but the
+        // candidate must still surface in the summary with its error rather than disappear.
+        const now = new Date().toISOString();
+        results.push({
+          id: newId('clip'),
+          sourceId: source.id,
+          creator: source.creator,
+          candidateId: cand.id,
+          start: cand.start,
+          end: cand.end,
+          coldOpen: null,
+          title: cand.title,
+          description: '',
+          hashtags: [],
+          hooks: [],
+          hookIndex: 0,
+          scores: cand.scores,
+          composite: cand.composite,
+          rankReason: cand.rankReason ?? '',
+          patterns: cand.patterns,
+          hiresOffset: 0,
+          status: 'planned',
+          error: message,
+          renders: 0,
+          createdAt: now,
+          updatedAt: now,
+        });
       }
+    }
+  }
+  return results;
+}
+
+/**
+ * Rebuilds a single clip's EDL with whatever `buildEdl`/`rebuildEdl` logic is current (e.g. the
+ * silence-aware pause tightening fix) and re-runs render + QC — how a clip that previously failed
+ * QC gets re-verified after a code fix, without re-doing hook generation or hi-res fetch (both
+ * already succeeded the first time). Clears any stale `clip.error` first.
+ */
+export async function requalifyClip(clipId: string, deps?: Partial<ProduceDeps>): Promise<Clip> {
+  const d: ProduceDeps = { ...defaultProduceDeps, ...deps };
+  const clip = loadClip(clipId);
+  if (clip.error) {
+    delete clip.error;
+    saveClip(clip);
+  }
+
+  await d.rebuildEdl(clip);
+
+  const doneRender = step(`requalifyClip ${clipId}: render`);
+  await d.renderClip(clipId);
+  doneRender();
+
+  const doneQc = step(`requalifyClip ${clipId}: qc`);
+  await d.qcClip(clipId);
+  doneQc();
+
+  return loadClip(clipId);
+}
+
+/**
+ * Requalifies every clip of `sourceId` currently in `status` (e.g. `qc_failed`) — see
+ * `requalifyClip`. Each clip is processed in its own try/catch, same failure-surfacing convention
+ * as `produceSource`: on error, `clip.error` is set and saved, and the loop continues.
+ */
+export async function requalifySource(sourceId: string, status: ClipStatus, deps?: Partial<ProduceDeps>): Promise<Clip[]> {
+  const targets = listClips((c) => c.sourceId === sourceId && c.status === status);
+  const results: Clip[] = [];
+  for (const c of targets) {
+    try {
+      results.push(await requalifyClip(c.id, deps));
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err);
+      log(`requalifySource ${sourceId}: clip ${c.id} failed: ${message}`);
+      let onDisk: Clip;
+      try {
+        onDisk = loadClip(c.id);
+      } catch {
+        onDisk = c;
+      }
+      onDisk.error = message;
+      saveClip(onDisk);
+      results.push(onDisk);
     }
   }
   return results;
