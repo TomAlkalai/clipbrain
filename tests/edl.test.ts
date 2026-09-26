@@ -39,3 +39,65 @@ it('cold open comes first and captions are monotonic in output time', () => {
   expect(e.captions[0].words.map(w => w.w)).toEqual(['Payoff', 'line.']);
   expect(e.captions[0].start).toBeCloseTo(0.1);
 });
+
+// ---- silence-aware pause tightening (dead-air root-cause fix, 2026-09-26) ----
+// Mirrors the real evidence in debug-dead-air.md: whisper word timings smear across a real
+// audio silence with ~0 gap between consecutive words, so the existing word-gap cutter never
+// sees it. silences.json (ffmpeg silencedetect) independently reports the real silence.
+const silenceWords = [
+  { w: 'as', start: 5.00, end: 5.10 },
+  { w: 'a', start: 5.10, end: 5.20 },
+  { w: 'business', start: 5.20, end: 6.80 },
+  { w: 'grows,', start: 6.95, end: 7.30 },
+];
+const silenceBase = {
+  words: silenceWords,
+  shots: [{ start: 0, end: 10 }],
+  faces: [{ t: 5, faces: [] }],
+  srcAspect: A, hiresOffset: 0, videoSrc: 'x.mp4', hook: null, style: 'default',
+  start: 0, end: 10, coldOpen: null,
+};
+
+it('cuts a real silence that whisper words smear across (no word gap), dropping duration by ~(silence - keepPause)', () => {
+  const e = buildEdl({ ...silenceBase, silences: [{ start: 5.05, end: 6.95 }] });
+  // silence duration 1.9s, default keepPause 0.15s -> drop ~1.75s (10 - 1.75 = 8.25)
+  expect(e.durationSec).toBeCloseTo(10 - (1.9 - 0.15), 3);
+  expect(e.segments.length).toBe(2);
+  expect(e.segments[0].srcEnd).toBeCloseTo(5.125, 3);
+  expect(e.segments[1].srcStart).toBeCloseTo(6.875, 3);
+});
+
+it('never shows a caption word at an output time before its piece begins, and clips/re-times words the silence swallowed', () => {
+  const e = buildEdl({ ...silenceBase, silences: [{ start: 5.05, end: 6.95 }] });
+  const allWords = e.captions.flatMap((c) => c.words);
+  const find = (w: string) => {
+    const found = allWords.find((x) => x.w === w);
+    if (!found) throw new Error(`word "${w}" missing from captions entirely`);
+    return found;
+  };
+  // 'a' straddles the cut start: clipped to its kept portion (piece 0 ends at output 5.125s),
+  // not shown through to its natural (pre-cut) end of 5.20.
+  const a = find('a');
+  expect(a.start).toBeCloseTo(5.10, 3);
+  expect(a.end).toBeCloseTo(5.125, 3);
+  // 'business' lies entirely inside the removed interval: re-timed into the first 0.25s of the
+  // next kept piece (which begins at output 5.125s) instead of vanishing or bleeding earlier
+  // (into piece 0's own output slot, which would mean showing it "inside the cut").
+  const business = find('business');
+  expect(business.start).toBeGreaterThanOrEqual(5.125 - 1e-6);
+  expect(business.end - business.start).toBeLessThanOrEqual(0.25 + 1e-6);
+  // 'grows,' resumes normally once real speech is back.
+  const grows = find('grows,');
+  expect(grows.start).toBeCloseTo(5.2, 3);
+  expect(grows.end).toBeCloseTo(5.55, 3);
+  // caption pages stay monotonic (existing invariant, still holds with the new cut source)
+  const starts = e.captions.map((c) => c.start);
+  expect([...starts].sort((x, y) => x - y)).toEqual(starts);
+});
+
+it('with no silences given, behaves exactly as before (word-gap-only tightening is unaffected)', () => {
+  const withEmptySilences = buildEdl({ ...base, start: 9.9, end: 13.4, coldOpen: null, silences: [] });
+  const withoutSilencesField = buildEdl({ ...base, start: 9.9, end: 13.4, coldOpen: null });
+  expect(withEmptySilences.durationSec).toBeCloseTo(withoutSilencesField.durationSec, 6);
+  expect(withEmptySilences.segments).toEqual(withoutSilencesField.segments);
+});

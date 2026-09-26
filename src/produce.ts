@@ -13,7 +13,7 @@ import { listChannel } from './yt/ytdlp.js';
 import { mmss } from './select/propose.js';
 import { ledgerSummary } from './llm/llm.js';
 import { log, step } from './log.js';
-import type { Clip, Word, Shot, FaceSample, Source, Creator, Candidate, Sentence, RefShort } from './types.js';
+import type { Clip, Word, Shot, FaceSample, Source, Creator, Candidate, Sentence, RefShort, Silence } from './types.js';
 
 // Task 14: hooks -> edl -> render -> qc orchestration for shortlisted candidates, plus the
 // run/eval/scout entry points. `rebuildEdl` (below) predates this — it was needed by Task 13's
@@ -94,6 +94,10 @@ export async function rebuildEdl(clip: Clip, overrides?: { maxPause?: number; fi
   const words = readJson<Word[]>(path.join(dir, 'words.json'));
   const shots = readJson<Shot[]>(path.join(dir, 'shots.json'));
   const faces = readJson<FaceSample[]>(path.join(dir, 'faces.json'));
+  // Root-cause fix (2026-09-26, debug-dead-air.md): buildEdl also tightens real audio silences
+  // (independent of whisper word timings, which can smear across one) — readJsonOr so a source
+  // analyzed before silence detection existed still rebuilds (falls back to word-gaps only).
+  const silences = readJsonOr<Silence[]>(path.join(dir, 'silences.json'), []);
 
   await ensureHires(clip, source);
 
@@ -105,6 +109,7 @@ export async function rebuildEdl(clip: Clip, overrides?: { maxPause?: number; fi
     words,
     shots,
     faces,
+    silences,
     srcAspect: source.width / source.height,
     hiresOffset: clip.hiresOffset,
     videoSrc: 'hires.mp4',
