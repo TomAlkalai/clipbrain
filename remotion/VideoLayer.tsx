@@ -1,6 +1,7 @@
 import React from 'react';
-import { AbsoluteFill, OffthreadVideo, interpolate, useCurrentFrame } from 'remotion';
+import { AbsoluteFill, OffthreadVideo } from 'remotion';
 import { cropRect } from '../src/edit/crop';
+import { segmentVolume } from '../src/edit/timing';
 import type { Layout, Rect } from '../src/types';
 
 const Cropped: React.FC<{
@@ -36,8 +37,7 @@ export const VideoLayer: React.FC<{ src: string; startFrom: number; layout: Layo
   srcAspect,
   frames,
 }) => {
-  const vol = (f: number) =>
-    interpolate(f, [0, 2, frames - 2, frames], [0, 1, 1, 0], { extrapolateLeft: 'clamp', extrapolateRight: 'clamp' });
+  const vol = (f: number) => segmentVolume(f, frames);
 
   if (layout.kind === 'face')
     return (

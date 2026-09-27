@@ -1,6 +1,7 @@
 import React from 'react';
 import { AbsoluteFill, spring, useCurrentFrame, useVideoConfig } from 'remotion';
 import { loadFont } from '@remotion/google-fonts/Montserrat';
+import { entryAnimationFrames } from '../src/edit/timing';
 import type { EdlCaption } from '../src/types';
 
 // Scoped to exactly the weight/subset actually used (weight 900, latin) instead of the default
@@ -22,11 +23,12 @@ export const Captions: React.FC<{ captions: EdlCaption[]; st: { accent: string; 
   if (!page) return null;
 
   const pageStartFrame = Math.round(page.start * fps);
+  const pageEndFrame = Math.round(page.end * fps);
   const scale = spring({
     frame: frame - pageStartFrame,
     fps,
     config: { damping: 200 },
-    durationInFrames: PAGE_ENTRY_FRAMES,
+    durationInFrames: entryAnimationFrames(pageEndFrame - pageStartFrame, PAGE_ENTRY_FRAMES),
     from: 0.85,
     to: 1,
   });
