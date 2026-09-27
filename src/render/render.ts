@@ -1,5 +1,6 @@
 import fs from 'node:fs';
 import path from 'node:path';
+import crypto from 'node:crypto';
 import { bundle } from '@remotion/bundler';
 import { renderMedia, selectComposition } from '@remotion/renderer';
 import { ROOT, DATA } from '../config.js';
@@ -48,12 +49,64 @@ async function probeDuration(file: string): Promise<number> {
   return Number(j.format?.duration ?? 0);
 }
 
+export type DownloadHires = (windowStart: number, windowEnd: number, outPath: string) => Promise<void>;
+export type ProbeDurationFn = (file: string) => Promise<number>;
+
+const HIRES_DURATION_TOLERANCE_SEC = 0.6;
+
+/**
+ * Downloads (via `download`) into a fresh temp file next to `hiresPath`, verifies its duration
+ * against the expected `[windowStart, windowEnd)` window, and only then atomically renames it
+ * over `hiresPath`. On any failure — the download itself, or a duration mismatch — the temp file
+ * is removed and `hiresPath` (if it already existed) is left untouched.
+ *
+ * Root-cause fix (Bug 2, important): `ensureHires`'s YouTube branch used to call
+ * `downloadSection(url, start, end, hiresPath)` directly onto an EXISTING hires.mp4. yt-dlp sees
+ * a file already at that exact output path and skips the download ("has already been
+ * downloaded"), so after a QC fix extends the clip's window, the OLD, shorter file silently
+ * stays in place — and every subsequent render fails the duration check forever, since the file
+ * never actually gets replaced. Downloading to a distinct temp path first (never `hiresPath`
+ * itself) means yt-dlp/ffmpeg always writes a real, fresh file, which is verified before it ever
+ * replaces the one downstream code depends on.
+ *
+ * `download`/`probeDuration` are injected so this is unit-testable with no network and no real
+ * media files (see tests/render.test.ts).
+ */
+export async function fetchAndReplaceHires(
+  hiresPath: string,
+  windowStart: number,
+  windowEnd: number,
+  download: DownloadHires,
+  probeDuration: ProbeDurationFn,
+): Promise<void> {
+  const dir = path.dirname(hiresPath);
+  fs.mkdirSync(dir, { recursive: true });
+  const tmpPath = path.join(dir, `hires.tmp-${crypto.randomBytes(6).toString('hex')}.mp4`);
+  try {
+    await download(windowStart, windowEnd, tmpPath);
+
+    const dur = await probeDuration(tmpPath);
+    const expected = windowEnd - windowStart;
+    if (Math.abs(dur - expected) > HIRES_DURATION_TOLERANCE_SEC) {
+      throw new Error(
+        `ensureHires: downloaded hires duration ${dur.toFixed(2)}s does not match expected window ${expected.toFixed(2)}s (±${HIRES_DURATION_TOLERANCE_SEC}s) for ${hiresPath}`,
+      );
+    }
+
+    fs.renameSync(tmpPath, hiresPath);
+  } catch (err) {
+    if (fs.existsSync(tmpPath)) fs.rmSync(tmpPath, { force: true });
+    throw err;
+  }
+}
+
 /**
  * Ensures `data/clips/<id>/hires.mp4` covers the window needed to render this clip (its main
  * range plus cold open, each padded by 1s, per R… see task-12 brief). Reuses the existing file
  * when it already covers the window; otherwise re-fetches it (YouTube section download, or an
- * ffmpeg re-encode for a local file source) and updates `clip.hiresOffset` to the window start.
- * Verifies the resulting file's duration is within 0.6s of the expected window length.
+ * ffmpeg re-encode for a local file source) via `fetchAndReplaceHires` (downloads to a temp file,
+ * verifies, then atomically replaces `hires.mp4` — see Bug 2 fix above) and updates
+ * `clip.hiresOffset` to the window start.
  */
 export async function ensureHires(clip: Clip, source: Source): Promise<void> {
   const dir = paths.clip(clip.id);
@@ -69,33 +122,28 @@ export async function ensureHires(clip: Clip, source: Source): Promise<void> {
     }
   }
 
-  fs.mkdirSync(dir, { recursive: true });
-  if (source.kind === 'youtube') {
-    if (!source.url) throw new Error(`source ${source.id} is kind=youtube but has no url`);
-    await downloadSection(source.url, windowStart, windowEnd, hiresPath);
-  } else {
-    if (!source.filePath) throw new Error(`source ${source.id} is kind=file but has no filePath`);
-    await runOk(ffmpeg(), [
-      '-y',
-      '-ss', String(windowStart),
-      '-to', String(windowEnd),
-      '-i', source.filePath,
-      '-c:v', 'libx264',
-      '-preset', 'veryfast',
-      '-crf', '16',
-      '-c:a', 'aac',
-      '-b:a', '192k',
-      hiresPath,
-    ]);
-  }
+  const download: DownloadHires = async (start, end, outPath) => {
+    if (source.kind === 'youtube') {
+      if (!source.url) throw new Error(`source ${source.id} is kind=youtube but has no url`);
+      await downloadSection(source.url, start, end, outPath);
+    } else {
+      if (!source.filePath) throw new Error(`source ${source.id} is kind=file but has no filePath`);
+      await runOk(ffmpeg(), [
+        '-y',
+        '-ss', String(start),
+        '-to', String(end),
+        '-i', source.filePath,
+        '-c:v', 'libx264',
+        '-preset', 'veryfast',
+        '-crf', '16',
+        '-c:a', 'aac',
+        '-b:a', '192k',
+        outPath,
+      ]);
+    }
+  };
 
-  const dur = await probeDuration(hiresPath);
-  const expected = windowEnd - windowStart;
-  if (Math.abs(dur - expected) > 0.6) {
-    throw new Error(
-      `ensureHires: hires.mp4 duration ${dur.toFixed(2)}s does not match expected window ${expected.toFixed(2)}s (±0.6s) for clip ${clip.id}`,
-    );
-  }
+  await fetchAndReplaceHires(hiresPath, windowStart, windowEnd, download, probeDuration);
   clip.hiresOffset = windowStart;
 }
 

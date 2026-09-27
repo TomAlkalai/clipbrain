@@ -1,7 +1,7 @@
 import { it, expect } from 'vitest';
 import fs from 'node:fs'; import os from 'node:os'; import path from 'node:path';
 import { startStaticServer } from '../src/render/static.js';
-import { parseLoudnorm, parseEbur128Summary, masterRetryPlan, truncateEdl } from '../src/render/render.js';
+import { parseLoudnorm, parseEbur128Summary, masterRetryPlan, truncateEdl, fetchAndReplaceHires } from '../src/render/render.js';
 import type { Edl } from '../src/types.js';
 it('serves byte ranges', async () => {
   const d = fs.mkdtempSync(path.join(os.tmpdir(), 'cbs-')); fs.writeFileSync(path.join(d, 'a.mp4'), Buffer.from('0123456789'));
@@ -67,4 +67,106 @@ it('truncateEdl also clips the hook end when it exceeds the truncated duration',
   const t = truncateEdl(baseEdl, 2);
   expect(t.durationSec).toBe(2);
   expect(t.hook).toEqual({ text: 'hi', start: 0, end: 2 });
+});
+
+// ---- Bug 2 (important): a stale hi-res file is reused after the clip window grows ----
+// Root cause: `ensureHires`'s YouTube branch called `downloadSection(url, start, end, hiresPath)`
+// straight onto an EXISTING hires.mp4. yt-dlp skips the download ("has already been downloaded"),
+// so the old, shorter file stays — and the very next duration check throws
+// "does not match expected window" forever, because the file never actually gets replaced.
+// `fetchAndReplaceHires` downloads to a fresh temp path in the same dir, verifies its duration,
+// and only then atomically renames it over hiresPath — with `download`/`probeDuration` injected
+// so this is testable with no network and no real media files.
+function mkTmpClipDir(): string {
+  return fs.mkdtempSync(path.join(os.tmpdir(), 'cb-hires-'));
+}
+function tmpLeftovers(dir: string): string[] {
+  return fs.readdirSync(dir).filter((f) => f.includes('.tmp-'));
+}
+
+it('fetchAndReplaceHires: downloads to a temp path (never the final path) and renames it into place on success', async () => {
+  const dir = mkTmpClipDir();
+  const hiresPath = path.join(dir, 'hires.mp4');
+  let downloadedTo = '';
+  await fetchAndReplaceHires(
+    hiresPath,
+    10,
+    20,
+    async (start, end, outPath) => {
+      expect(start).toBe(10);
+      expect(end).toBe(20);
+      downloadedTo = outPath;
+      fs.writeFileSync(outPath, 'FRESH');
+    },
+    async () => 10, // matches expected window (20 - 10)
+  );
+  expect(fs.readFileSync(hiresPath, 'utf8')).toBe('FRESH');
+  expect(downloadedTo).not.toBe(hiresPath);
+  expect(path.basename(downloadedTo)).toMatch(/^hires\.tmp-.+\.mp4$/);
+  expect(fs.existsSync(downloadedTo)).toBe(false); // renamed away, not left behind
+  expect(tmpLeftovers(dir)).toEqual([]);
+});
+
+it('fetchAndReplaceHires: replaces a stale, too-short existing hires.mp4 instead of leaving it in place', () => {
+  const dir = mkTmpClipDir();
+  const hiresPath = path.join(dir, 'hires.mp4');
+  fs.writeFileSync(hiresPath, 'STALE-129s');
+  return fetchAndReplaceHires(
+    hiresPath,
+    0,
+    131.14,
+    async (_s, _e, outPath) => fs.writeFileSync(outPath, 'FRESH-131s'),
+    async () => 131.14,
+  ).then(() => {
+    expect(fs.readFileSync(hiresPath, 'utf8')).toBe('FRESH-131s');
+    expect(tmpLeftovers(dir)).toEqual([]);
+  });
+});
+
+it('fetchAndReplaceHires: leaves the existing hires.mp4 untouched and cleans up the temp file when the downloaded duration mismatches', async () => {
+  const dir = mkTmpClipDir();
+  const hiresPath = path.join(dir, 'hires.mp4');
+  fs.writeFileSync(hiresPath, 'ORIGINAL');
+  await expect(
+    fetchAndReplaceHires(
+      hiresPath,
+      0,
+      131.14,
+      async (_s, _e, outPath) => fs.writeFileSync(outPath, 'TOO-SHORT'),
+      async () => 129.13,
+    ),
+  ).rejects.toThrow(/does not match expected window/);
+  expect(fs.readFileSync(hiresPath, 'utf8')).toBe('ORIGINAL');
+  expect(tmpLeftovers(dir)).toEqual([]);
+});
+
+it('fetchAndReplaceHires: leaves the existing hires.mp4 untouched and cleans up the temp file when the download itself fails', async () => {
+  const dir = mkTmpClipDir();
+  const hiresPath = path.join(dir, 'hires.mp4');
+  fs.writeFileSync(hiresPath, 'ORIGINAL');
+  await expect(
+    fetchAndReplaceHires(
+      hiresPath,
+      0,
+      10,
+      async () => { throw new Error('yt-dlp network failure'); },
+      async () => 10,
+    ),
+  ).rejects.toThrow('yt-dlp network failure');
+  expect(fs.readFileSync(hiresPath, 'utf8')).toBe('ORIGINAL');
+  expect(tmpLeftovers(dir)).toEqual([]);
+});
+
+it('fetchAndReplaceHires: creates the clip dir when it does not exist yet, and succeeds when there is no existing hires.mp4', async () => {
+  const dir = mkTmpClipDir();
+  const clipDir = path.join(dir, 'clip_new');
+  const hiresPath = path.join(clipDir, 'hires.mp4');
+  await fetchAndReplaceHires(
+    hiresPath,
+    0,
+    5,
+    async (_s, _e, outPath) => fs.writeFileSync(outPath, 'FIRST'),
+    async () => 5,
+  );
+  expect(fs.readFileSync(hiresPath, 'utf8')).toBe('FIRST');
 });

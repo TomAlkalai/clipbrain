@@ -227,20 +227,29 @@ export async function downloadProxy(url: string, outMp4: string): Promise<void> 
   await runOk(ytdlp(), args, { timeoutMs: PROXY_TIMEOUT_MS });
 }
 
-export async function downloadSection(url: string, start: number, end: number, outMp4: string): Promise<void> {
-  fs.mkdirSync(path.dirname(outMp4), { recursive: true });
-  const args = [
+// Pure args builder for downloadSection — see Bug 2 fix (src/render/render.ts,
+// fetchAndReplaceHires): `--force-overwrites` is unconditional so yt-dlp never silently no-ops
+// ("has already been downloaded") when handed a path that happens to already exist, instead of
+// re-downloading and updating it. render.ts no longer relies on this alone (it always downloads
+// to a fresh temp path first), but downloadSection itself should not have this footgun either.
+export function downloadSectionArgs(url: string, start: number, end: number, outMp4: string): string[] {
+  return [
     ...baseArgs(),
     '-f',
     'bv*[height<=1080][ext=mp4]+ba[ext=m4a]/bv*[height<=1080]+ba/b',
     '--download-sections',
     `*${start}-${end}`,
     '--force-keyframes-at-cuts',
+    '--force-overwrites',
     '--merge-output-format',
     'mp4',
     '-o',
     outMp4,
     url,
   ];
-  await runOk(ytdlp(), args, { timeoutMs: SECTION_TIMEOUT_MS });
+}
+
+export async function downloadSection(url: string, start: number, end: number, outMp4: string): Promise<void> {
+  fs.mkdirSync(path.dirname(outMp4), { recursive: true });
+  await runOk(ytdlp(), downloadSectionArgs(url, start, end, outMp4), { timeoutMs: SECTION_TIMEOUT_MS });
 }
