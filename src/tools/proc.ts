@@ -73,3 +73,19 @@ export async function runOk(cmd: string, args: string[], opts: RunOpts = {}): Pr
   }
   return r;
 }
+
+/**
+ * True for the specific error shape @remotion/renderer's browser/compositor teardown emits on
+ * Windows: `error.code === 'EPERM'`, `error.syscall === 'kill'` — a ChildProcess with no 'error'
+ * listener attached failing to kill an already-exited (or otherwise inaccessible) process during
+ * cleanup. Node re-emits an unlistened 'error' event as an uncaughtException, which (Bug 3) used
+ * to crash the whole CLI process even when the render itself had already succeeded, or had
+ * already failed for a separate, already-handled reason — abandoning every remaining clip in a
+ * batch. src/cli.ts's global uncaughtException/unhandledRejection handlers use this predicate to
+ * swallow ONLY this exact shape; anything else must still crash the process. Pure.
+ */
+export function isIgnorableKillEperm(err: unknown): boolean {
+  if (!err || typeof err !== 'object') return false;
+  const e = err as { code?: unknown; syscall?: unknown };
+  return e.code === 'EPERM' && e.syscall === 'kill';
+}

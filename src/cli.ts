@@ -1,5 +1,6 @@
 import path from 'node:path';
 import { doctor as runDoctor, setup as runSetup } from './tools/bins.js';
+import { isIgnorableKillEperm } from './tools/proc.js';
 import { log, step } from './log.js';
 import { llmJson, setBackend, ledgerSummary } from './llm/llm.js';
 import { claudeBackend } from './llm/claude.js';
@@ -844,7 +845,30 @@ function printHelp(): void {
   }
 }
 
+// Bug 3 fix (important): a renderer failure used to kill the whole CLI. @remotion/renderer's
+// browser/compositor teardown can emit an 'error' event (code EPERM, syscall 'kill') on a
+// Windows ChildProcess with no 'error' listener — e.g. right after Bug 1's crash, while Remotion
+// is tearing itself down. Node re-emits an unlistened 'error' event as an uncaughtException,
+// which crashed the whole process before the per-clip try/catch in produce/requalify ever ran,
+// abandoning every remaining clip in a batch. These handlers swallow ONLY that exact shape
+// (isIgnorableKillEperm — src/tools/proc.ts) with a one-line warning; everything else still logs
+// and exits non-zero, same as before.
+function installCrashGuards(): void {
+  const handle = (err: unknown): void => {
+    if (isIgnorableKillEperm(err)) {
+      log('warning: ignoring EPERM from a child-process kill during renderer teardown (Bug 3 mitigation)');
+      return;
+    }
+    log('error:', err instanceof Error ? err.stack ?? err.message : String(err));
+    process.exitCode = 1;
+    process.exit(1);
+  };
+  process.on('uncaughtException', handle);
+  process.on('unhandledRejection', handle);
+}
+
 async function main(): Promise<void> {
+  installCrashGuards();
   const argv = process.argv.slice(2);
   const parsed = parseArgs(argv);
   const [cmdName, ...rest] = parsed._;
