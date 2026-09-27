@@ -135,7 +135,7 @@ const CONTIGUOUS_EPS = 1e-6; // pieces this close in time are "touching" (float 
 /**
  * Merges any piece shorter than `minSeg` into whichever neighbour it's actually time-contiguous
  * with (extending that neighbour and dropping the shot cut between them) — restarting the scan
- * after each merge/drop so a cascade (a merge creating a new short piece) resolves correctly.
+ * after each merge so a cascade (a merge creating a new short piece) resolves correctly.
  *
  * Fix round 1 (2026-09-26): this now runs over a WHOLE range's pieces (every run within it, not
  * just one run's own shot-split fragments — see `buildEdl`), so a short piece can have a neighbour
@@ -143,9 +143,15 @@ const CONTIGUOUS_EPS = 1e-6; // pieces this close in time are "touching" (float 
  * `speechRuns`/`piecesFromCuts` just cut). Extending a piece's bound across that gap would silently
  * re-include the cut dead air — exactly the bug this whole round exists to remove — so a short
  * piece is merged (bounds extended) only into a neighbour it TOUCHES (contiguous in time, within
- * `CONTIGUOUS_EPS`; always true for same-run shot-split fragments, by construction). A short piece
- * with no contiguous neighbour on either side (an isolated short run, boxed in by real pause gaps
- * on both sides) is dropped entirely instead of bridging one of those gaps. Pure.
+ * `CONTIGUOUS_EPS`; always true for same-run shot-split fragments, by construction).
+ *
+ * Fix round 2 (2026-09-27): round 1 DROPPED an isolated short piece with no contiguous neighbour
+ * on either side — but that silently deletes real speech an isolated short run can genuinely
+ * contain (e.g. a one-word reply boxed in by two real pause cuts on both sides: neither bridging a
+ * gap nor deleting the word is acceptable). Dropping is `buildEdl`'s job now, and only for pieces
+ * under `MIN_PIECE_SEC` (pure keepHalf padding, checked BEFORE this function ever runs) — this
+ * function itself never removes a piece it wasn't asked to merge; an isolated short piece with no
+ * contiguous neighbour is simply left as its own (under-`minSeg`) segment. Pure.
  */
 function mergeShortPieces(pieces: Piece[], minSeg: number): Piece[] {
   const result = pieces.map((p) => ({ ...p }));
@@ -158,14 +164,19 @@ function mergeShortPieces(pieces: Piece[], minSeg: number): Piece[] {
       const touchesNext = i < result.length - 1 && Math.abs(result[i + 1].start - result[i].end) < CONTIGUOUS_EPS;
       if (touchesPrev) {
         result[i - 1] = { start: result[i - 1].start, end: result[i].end };
+        result.splice(i, 1);
+        changed = true;
+        break;
       } else if (touchesNext) {
         result[i + 1] = { start: result[i].start, end: result[i + 1].end };
+        result.splice(i, 1);
+        changed = true;
+        break;
       }
-      // else: isolated short piece, no contiguous neighbour on either side — drop it (below)
-      // rather than bridge a real gap.
-      result.splice(i, 1);
-      changed = true;
-      break;
+      // else: isolated short piece, no contiguous neighbour on either side — leave it as its own
+      // segment. Merging would bridge a real, deliberately-kept pause gap (reintroducing dead
+      // air); dropping would delete whatever real content it contains. Neither is safe, so it
+      // survives under-`minSeg` rather than either.
     }
   }
   return result;
@@ -283,10 +294,14 @@ export function buildEdl(i: EdlInput): Edl {
     // Every run's shot-split pieces are collected for the WHOLE range first, THEN cleaned once
     // (fix round 1, 2026-09-26): a cut landing right at range.start/range.end (or two cuts close
     // together) can leave a run that's entirely one tiny sliver, with no sibling of its own run to
-    // merge into — collecting across runs (still scoped to this one range) gives `MIN_PIECE_SEC`/
-    // `mergeShortPieces` a real neighbour to work with. `MIN_PIECE_SEC` (silence edge padding —
-    // pure `keepHalf` trim residue, never real spoken content) is dropped unconditionally before
-    // the minSeg merge pass runs, so it can't itself get merged into (and inflate) a neighbour.
+    // merge into — collecting across runs (still scoped to this one range) gives `mergeShortPieces`
+    // a real neighbour to work with. `MIN_PIECE_SEC` (silence edge padding — pure `keepHalf` trim
+    // residue, never real spoken content) is the ONLY thing ever dropped here, unconditionally,
+    // before the minSeg merge pass runs. A piece at or above `MIN_PIECE_SEC` is never dropped, even
+    // if it's short and isolated (no contiguous neighbour to merge into) — fix round 2, 2026-09-27:
+    // dropping one of those would silently delete real speech it can genuinely contain (e.g. a
+    // one-word reply boxed in by two real pause cuts) — `mergeShortPieces` now just leaves it as
+    // its own (under-`minSeg`) segment instead.
     const rangePieces: Piece[] = [];
     for (const run of speechRuns(range, i.words, maxPause, keepHalf, silences)) {
       rangePieces.push(...splitAtShots(run, i.shots, EDGE_GUARD));

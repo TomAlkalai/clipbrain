@@ -202,25 +202,58 @@ it('drops the same kind of sliver in the cold-open range (scoped per-range, main
   expect(e.durationSec).toBeCloseTo(1.075 + 5, 3);
 });
 
-it('an isolated short run boxed in by two real pause cuts is dropped, never bridged back into a neighbour (would reintroduce dead air)', () => {
-  // Two word-gap cuts leave a 0.45s middle run (below the 0.5s default minSeg) with a real,
-  // deliberately-kept pause gap on BOTH sides — merging it into either neighbour would extend a
-  // segment's srcStart/srcEnd across one of those gaps, silently re-including the cut dead air.
+// Fix round 2 (coordinator review, 2026-09-27): round 1 dropped this isolated short run
+// entirely, which deletes real speech it can contain — a re-reviewer ran this exact fixture and
+// found the real word "Yes." (the isolated middle run) vanished from the segments, while its
+// caption got orphan-re-timed to flash at [2.075, 2.15] over what was now padding audio. Merging
+// it into either neighbour is still wrong too (bridges a real, deliberately-kept pause gap and
+// reintroduces dead air) — so it must survive as ITS OWN segment instead, under-`minSeg` but real.
+it('an isolated short run boxed in by two real pause cuts is KEPT as its own segment when it contains real speech (never dropped, never bridged into a neighbour)', () => {
   const e = buildEdl({
     ...minimalBase,
     words: [
       { w: 'w1', start: 0.0, end: 2.0 },
-      { w: 'w2', start: 3.0, end: 3.3 }, // the short, isolated middle run
+      { w: 'Yes.', start: 3.0, end: 3.3 }, // the short, isolated middle run — real speech
       { w: 'w3', start: 4.3, end: 19.9 },
     ],
     start: 0, end: 20, coldOpen: null,
     silences: [],
   });
-  expect(e.segments.length).toBe(2);
+  // the middle segment survives on its own, at >= MIN_PIECE_SEC (0.45s) but below minSeg (0.5s)
+  expect(e.segments.length).toBe(3);
   expect(e.segments[0].srcStart).toBeCloseTo(0, 3);
   expect(e.segments[0].srcEnd).toBeCloseTo(2.075, 3);
-  expect(e.segments[1].srcStart).toBeCloseTo(4.225, 3);
-  expect(e.segments[1].srcEnd).toBeCloseTo(20, 3);
+  expect(e.segments[1].srcStart).toBeCloseTo(2.925, 3);
+  expect(e.segments[1].srcEnd).toBeCloseTo(3.375, 3);
+  expect(e.segments[2].srcStart).toBeCloseTo(4.225, 3);
+  expect(e.segments[2].srcEnd).toBeCloseTo(20, 3);
   // neither segment spans across either of the two real gaps ([2.075,2.925] or [3.375,4.225])
-  expect(e.durationSec).toBeCloseTo(2.075 + 15.775, 3);
+  expect(e.durationSec).toBeCloseTo(2.075 + 0.45 + 15.775, 3);
+
+  // "Yes." is not lost, not orphan-flashed elsewhere — its caption sits inside its OWN segment's
+  // output time range (piece 1's output span: [2.075, 2.525])
+  const yes = e.captions.flatMap((c) => c.words).find((w) => w.w === 'Yes.')!;
+  expect(yes).toBeDefined();
+  expect(yes.start).toBeGreaterThanOrEqual(2.075 - 1e-6);
+  expect(yes.end).toBeLessThanOrEqual(2.525 + 1e-6);
+});
+
+it('a sub-0.15s padding sliver with no word in it is still dropped (not kept as a degenerate segment)', () => {
+  // Same mechanism as the range.start/range.end boundary tests above — the sliver is pure
+  // keepHalf trim residue with no word anywhere near it — but asserted standalone and explicitly
+  // on the "no word survives from the dropped span" property, as the direct contrast to the
+  // "isolated short run WITH a word is kept" case right above.
+  const e = buildEdl({
+    ...minimalBase,
+    words: [{ w: 'far', start: 5.0, end: 5.3 }], // nowhere near the sliver — just proves normal content survives
+    start: 0, end: 10, coldOpen: null,
+    silences: [{ start: 0, end: 2.0 }], // silence at range.start -> [0, 0.075] sliver, no word in it
+  });
+  expect(e.segments.length).toBe(1);
+  expect(e.segments[0].srcStart).toBeCloseTo(1.925, 3); // the [0, 0.075] sliver is gone
+  expect(e.segments[0].srcEnd).toBeCloseTo(10, 3);
+  const allWords = e.captions.flatMap((c) => c.words);
+  expect(allWords.map((w) => w.w)).toEqual(['far']); // nothing else — no orphan/leftover from the sliver
+  // the surviving segment starts right at output 0 (the dropped sliver contributed nothing)
+  expect(allWords[0].start).toBeCloseTo(5.0 - 1.925, 3);
 });
