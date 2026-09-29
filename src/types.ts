@@ -31,10 +31,17 @@ export type Source = {
   title: string; durationSec: number; width: number; height: number; createdAt: string;
 };
 
+export type VisualMetrics = {
+  faceCoverage: number; twoShotRatio: number; fitRatio: number;
+  cutsPerMin: number; medianFaceH: number; longestNoFaceSec: number;
+};
+
 export type Candidate = {
   id: string; sourceId: string; startSid: number; endSid: number; start: number; end: number;
   title: string; summary: string; why: string; patterns: string[]; scores: Scores; composite: number;
   rank?: number; rankReason?: string; shortlisted: boolean;
+  boundary?: { openingStandalone: boolean; endingComplete: boolean; repaired: boolean; notes: string };
+  visual?: { score: number; metrics: VisualMetrics; issues: string[] };
 };
 
 export type Hook = { text: string; pattern: string; score: number };
@@ -64,6 +71,20 @@ export type Clip = {
   scores: Scores; composite: number; rankReason: string; patterns: string[];
   hiresOffset: number;                            // source second at hi-res file t=0
   edl?: Edl; qc?: QcReport; status: ClipStatus;
+  /** Remotion style name (remotion/style.ts STYLES key); defaults to 'default' when unset.
+   * Set by QC's move_hook_up auto-fix ('hook-high') and read by produce.ts's rebuildEdl. */
+  style?: string;
+  /** `FixPlan['kind']` values already applied to this clip across every QC run in its lifetime
+   * (not reset per qcClip() call) — lets planFix (qc/rules.ts) skip a fix that's already a no-op
+   * (e.g. loosen_pauses, which only has one level: maxPause 0.3) instead of paying for another
+   * identical re-render. See debug-dead-air.md ("planFix re-applied loosen_pauses with the same
+   * maxPause 0.3 — no change, wasting a full re-render"). */
+  qcFixHistory?: string[];
+  /** Candidate context copied over by planClip (Task 14) — shown defensively in the review UI. */
+  rank?: number;
+  why?: string;
+  visual?: Candidate['visual'];
+  boundary?: Candidate['boundary'];
   review?: { decision: 'approved' | 'rejected'; reason?: string; at: string };
   publish?: { videoId: string; publishAt?: string; privacy: string; at: string; dryRun: boolean };
   metrics?: { at: string; views: number; engagedViews?: number; avgViewPct?: number; avgViewSec?: number; source: 'analytics' | 'public' | 'csv' }[];

@@ -1,0 +1,383 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Clip Brain — Review</title>
+<style>
+  :root {
+    --bg: #f4f5f7; --card-bg: #ffffff; --text: #1b1f24; --muted: #6b7280; --border: #e2e5ea;
+    --ok: #1a7f37; --fail: #cf222e; --warn: #9a6700; --accent: #2563eb;
+  }
+  * { box-sizing: border-box; }
+  body { margin: 0; font-family: -apple-system, Segoe UI, Roboto, Arial, sans-serif; background: var(--bg); color: var(--text); }
+  header { position: sticky; top: 0; z-index: 5; background: var(--card-bg); border-bottom: 1px solid var(--border); padding: 12px 20px; }
+  header h1 { font-size: 16px; margin: 0 0 8px; }
+  #header-counts { display: flex; flex-wrap: wrap; gap: 8px; margin-bottom: 10px; }
+  .pill { font-size: 12px; padding: 3px 9px; border-radius: 999px; background: #eef0f3; border: 1px solid var(--border); }
+  .pill-cost { background: #eaf2ff; border-color: #cfe0fb; }
+  #tabs { display: flex; flex-wrap: wrap; gap: 6px; }
+  .tab { font-size: 13px; padding: 6px 12px; border-radius: 6px; border: 1px solid var(--border); background: var(--card-bg); cursor: pointer; }
+  .tab.active { background: var(--accent); color: #fff; border-color: var(--accent); }
+  main { padding: 20px; }
+  #grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(320px, 1fr)); gap: 18px; }
+  .empty { color: var(--muted); }
+  .card { background: var(--card-bg); border: 1px solid var(--border); border-radius: 10px; overflow: hidden; display: flex; flex-direction: column; }
+  .card-status { position: absolute; margin: 8px; padding: 2px 8px; font-size: 11px; border-radius: 999px; color: #fff; text-transform: uppercase; letter-spacing: .03em; }
+  .status-ready { background: #1a7f37; } .status-qc_failed { background: #cf222e; }
+  .status-approved { background: #2563eb; } .status-rejected { background: #6b7280; }
+  .status-published { background: #7c3aed; } .status-planned, .status-rendered { background: #9a6700; }
+  .card-video-wrap { position: relative; }
+  .card-video { display: block; width: 100%; aspect-ratio: 9 / 16; background: #000; max-height: 400px; margin: 0 auto; }
+  .card-body { padding: 10px 12px 14px; display: flex; flex-direction: column; gap: 10px; }
+  .title-row { display: flex; gap: 6px; }
+  .title-input { flex: 1; padding: 5px 7px; border: 1px solid var(--border); border-radius: 6px; font-size: 13px; }
+  .meta-row { display: flex; justify-content: space-between; font-size: 12px; color: var(--muted); gap: 8px; flex-wrap: wrap; }
+  .job-line { font-size: 12px; padding: 5px 8px; border-radius: 6px; background: #fff8e6; border: 1px solid #f2dd9a; }
+  .job-done { background: #eaf7ee; border-color: #bfe6c9; }
+  .job-error { background: #fdecea; border-color: #f3c2bd; }
+  .section-label { font-size: 11px; text-transform: uppercase; letter-spacing: .04em; color: var(--muted); margin-bottom: 4px; }
+  .score-row { display: flex; align-items: center; gap: 6px; font-size: 12px; margin-bottom: 3px; cursor: help; }
+  .score-name { width: 118px; flex-shrink: 0; color: var(--muted); }
+  .score-track { flex: 1; height: 6px; background: #eceef1; border-radius: 4px; overflow: hidden; }
+  .score-fill { height: 100%; background: var(--accent); }
+  .score-val { width: 18px; text-align: right; }
+  .why p { font-size: 12px; margin: 2px 0; }
+  .hooks { font-size: 12px; }
+  .hook-row { display: flex; align-items: center; gap: 6px; padding: 3px 0; cursor: pointer; }
+  .hook-text { flex: 1; }
+  .hook-meta { color: var(--muted); font-size: 11px; }
+  .qc-row { display: grid; grid-template-columns: 16px 130px 44px 1fr; gap: 6px; font-size: 11.5px; padding: 2px 0; align-items: start; }
+  .qc-ok .qc-mark { color: var(--ok); } .qc-fail .qc-mark { color: var(--fail); }
+  .qc-name { color: var(--text); } .qc-sev { color: var(--muted); } .qc-detail { color: var(--muted); }
+  .qc-none { font-size: 12px; color: var(--muted); }
+  .clip-error { font-size: 12px; color: var(--fail); margin-top: 4px; }
+  .schedule-row { display: flex; align-items: center; gap: 6px; font-size: 12px; flex-wrap: wrap; }
+  .schedule-input { padding: 4px 6px; border: 1px solid var(--border); border-radius: 6px; font-size: 12px; }
+  .actions { display: flex; gap: 8px; flex-wrap: wrap; }
+  .reason-panel { display: flex; gap: 6px; flex-wrap: wrap; align-items: center; }
+  .reason-input { flex: 1; min-width: 140px; padding: 6px 8px; border: 1px solid var(--border); border-radius: 6px; font-size: 13px; }
+  .actions button { flex: 1; padding: 7px 10px; border-radius: 6px; border: 1px solid var(--border); background: var(--card-bg); cursor: pointer; font-size: 13px; }
+  .btn-approve { background: var(--ok); color: #fff; border-color: var(--ok); }
+  .btn-override { background: #9a6700; color: #fff; border-color: #9a6700; }
+  .btn-reject { background: var(--fail); color: #fff; border-color: var(--fail); }
+  button { font-family: inherit; }
+  button.small { padding: 4px 8px; font-size: 12px; }
+</style>
+</head>
+<body>
+<header>
+  <h1>Clip Brain — Review</h1>
+  <div id="header-counts"></div>
+  <div id="tabs"></div>
+</header>
+<main>
+  <div id="grid"></div>
+</main>
+<script>
+(function () {
+  'use strict';
+
+  var SIGNALS = ['hook', 'standalone_clarity', 'payoff', 'novelty', 'emotional_intensity', 'information_density', 'audience_fit'];
+  var TABS = [
+    { key: 'ready', label: 'Ready' },
+    { key: 'qc_failed', label: 'QC failed' },
+    { key: 'approved', label: 'Approved' },
+    { key: 'rejected', label: 'Rejected' },
+    { key: 'published', label: 'Published' },
+    { key: 'all', label: 'All' },
+  ];
+
+  var clips = [];
+  var jobs = [];
+  var filter = 'ready';
+  var pollHandle = null;
+  // { clipId, kind: 'reject' | 'override' } while a card is showing its inline reason/note
+  // form in place of its action buttons — an ordinary form beats window.prompt()/confirm()
+  // here: it's keyboard- and automation-friendly and doesn't block the whole page.
+  var pending = null;
+
+  function esc(s) {
+    return String(s == null ? '' : s).replace(/[&<>"']/g, function (c) {
+      return { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c];
+    });
+  }
+
+  function mmss(sec) {
+    sec = Math.max(0, Math.round(sec || 0));
+    var m = Math.floor(sec / 60), s = sec % 60;
+    return m + ':' + String(s).padStart(2, '0');
+  }
+
+  function toLocalInputValue(iso) {
+    var d = new Date(iso);
+    if (isNaN(d.getTime())) return '';
+    var pad = function (n) { return String(n).padStart(2, '0'); };
+    return d.getFullYear() + '-' + pad(d.getMonth() + 1) + '-' + pad(d.getDate()) + 'T' + pad(d.getHours()) + ':' + pad(d.getMinutes());
+  }
+
+  async function api(path, opts) {
+    var res = await fetch(path, opts);
+    var body = null;
+    try { body = await res.json(); } catch (e) { /* empty/non-JSON body */ }
+    if (!res.ok) {
+      var msg = (body && body.error) || (res.status + ' ' + res.statusText);
+      throw new Error(msg);
+    }
+    return body;
+  }
+  function postJson(path, payload) {
+    return api(path, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(payload || {}) });
+  }
+
+  async function refreshClips() { clips = await api('/api/clips'); }
+  async function refreshJobs() { jobs = await api('/api/jobs'); }
+  async function refreshSummary() {
+    var s = await api('/api/summary');
+    renderHeader(s);
+  }
+  async function refreshAll() {
+    await Promise.all([refreshClips(), refreshJobs(), refreshSummary()]);
+    render();
+  }
+
+  function jobForClip(clipId) {
+    for (var i = jobs.length - 1; i >= 0; i--) if (jobs[i].clipId === clipId) return jobs[i];
+    return null;
+  }
+  function anyJobActive() {
+    return jobs.some(function (j) { return j.status === 'queued' || j.status === 'running'; });
+  }
+
+  function renderHeader(summary) {
+    var order = ['ready', 'qc_failed', 'approved', 'rejected', 'published', 'planned', 'rendered'];
+    var el = document.getElementById('header-counts');
+    el.innerHTML = order.map(function (k) {
+      return '<span class="pill pill-' + k + '">' + k + ': ' + (summary.counts[k] || 0) + '</span>';
+    }).join('') +
+      '<span class="pill pill-cost">LLM cost: $' + summary.ledger.costUsd.toFixed(4) +
+      ' (' + summary.ledger.calls + ' calls, ' + summary.ledger.cached + ' cached)</span>';
+  }
+
+  function renderTabs() {
+    var el = document.getElementById('tabs');
+    el.innerHTML = TABS.map(function (t) {
+      var n = t.key === 'all' ? clips.length : clips.filter(function (c) { return c.status === t.key; }).length;
+      return '<button class="tab' + (filter === t.key ? ' active' : '') + '" data-tab="' + t.key + '">' + t.label + ' (' + n + ')</button>';
+    }).join('');
+  }
+
+  function scoreBar(name, score, reason) {
+    var pct = Math.max(0, Math.min(10, score)) * 10;
+    return '<div class="score-row" title="' + esc(reason) + '">' +
+      '<span class="score-name">' + esc(name) + '</span>' +
+      '<div class="score-track"><div class="score-fill" style="width:' + pct + '%"></div></div>' +
+      '<span class="score-val">' + score + '</span></div>';
+  }
+
+  function cardHtml(clip) {
+    var job = jobForClip(clip.id);
+    var jobLine = job
+      ? '<div class="job-line job-' + job.status + '">rerender job: ' + job.status + (job.error ? ' — ' + esc(job.error) : '') + '</div>'
+      : '';
+
+    var scoreRows = SIGNALS.map(function (s) {
+      return clip.scores && clip.scores[s] ? scoreBar(s, clip.scores[s].score, clip.scores[s].reason) : '';
+    }).join('');
+    var extraRows = ['visual', 'boundary'].map(function (k) {
+      return clip[k] && typeof clip[k].score === 'number' ? scoreBar(k, clip[k].score, clip[k].reason || '') : '';
+    }).join('');
+
+    var hookRows = (clip.hooks || []).map(function (h, i) {
+      return '<label class="hook-row">' +
+        '<input type="radio" name="hook-' + clip.id + '" data-action="hook" data-clip-id="' + clip.id + '" value="' + i + '"' + (i === clip.hookIndex ? ' checked' : '') + '>' +
+        '<span class="hook-text">' + esc(h.text) + '</span>' +
+        '<span class="hook-meta">[' + esc(h.pattern) + ' · ' + h.score + ']</span></label>';
+    }).join('');
+
+    var qcRows = clip.qc && clip.qc.checks.length
+      ? clip.qc.checks.map(function (c) {
+          return '<div class="qc-row ' + (c.ok ? 'qc-ok' : 'qc-fail') + '">' +
+            '<span class="qc-mark">' + (c.ok ? '✔' : '✖') + '</span>' +
+            '<span class="qc-name">' + esc(c.name) + '</span>' +
+            '<span class="qc-sev">' + esc(c.severity) + '</span>' +
+            '<span class="qc-detail">' + esc(c.detail) + '</span></div>';
+        }).join('')
+      : '<div class="qc-none">not QC’d yet</div>';
+    var errorLine = clip.error ? '<div class="clip-error">error: ' + esc(clip.error) + '</div>' : '';
+
+    var scheduleVal = clip.plannedPublishAt ? toLocalInputValue(clip.plannedPublishAt) : '';
+    var canApprove = clip.status === 'ready';
+    var canOverride = clip.status === 'qc_failed';
+    var canReject = clip.status !== 'published';
+    var whyLine = clip.why ? '<p><strong>why:</strong> ' + esc(clip.why) + '</p>' : '';
+    var durLine = clip.idealDurationSec
+      ? ' (ideal ' + clip.idealDurationSec.min + '–' + clip.idealDurationSec.max + 's)'
+      : '';
+    // `rank` lives on Candidate, not (yet) on Clip — shown only if a future task copies it over.
+    var rankLine = typeof clip.rank === 'number' ? 'rank ' + clip.rank + ' · ' : '';
+
+    return '' +
+      '<div class="card" data-clip-id="' + clip.id + '">' +
+        '<div class="card-video-wrap">' +
+          '<span class="card-status status-' + clip.status + '">' + esc(clip.status) + '</span>' +
+          '<video class="card-video" controls preload="metadata"' +
+            ' poster="/media/clips/' + clip.id + '/poster.jpg?v=' + encodeURIComponent(clip.updatedAt) + '"' +
+            ' src="/media/clips/' + clip.id + '/render.mp4?v=' + encodeURIComponent(clip.updatedAt) + '"></video>' +
+        '</div>' +
+        '<div class="card-body">' +
+          '<div class="title-row">' +
+            '<input type="text" class="title-input" data-clip-id="' + clip.id + '" value="' + esc(clip.title) + '" maxlength="100">' +
+            '<button class="small" data-action="save-title" data-clip-id="' + clip.id + '">Save</button>' +
+          '</div>' +
+          '<div class="meta-row">' +
+            '<span>' + rankLine + 'composite ' + Number(clip.composite).toFixed(2) + durLine + '</span>' +
+            '<span>' + mmss(clip.start) + '–' + mmss(clip.end) + ' · ' + esc(clip.sourceTitle || clip.sourceId) + '</span>' +
+          '</div>' +
+          jobLine +
+          '<div class="scores">' + scoreRows + extraRows + '</div>' +
+          '<div class="why">' + whyLine + '<p><strong>rank reason:</strong> ' + esc(clip.rankReason) + '</p></div>' +
+          '<div class="hooks"><div class="section-label">hooks (pick to re-render)</div>' + hookRows + '</div>' +
+          '<div class="qc"><div class="section-label">QC</div>' + qcRows + errorLine + '</div>' +
+          '<div class="schedule-row">' +
+            '<label>publish at: <input type="datetime-local" class="schedule-input" data-clip-id="' + clip.id + '" value="' + scheduleVal + '"></label>' +
+            '<button class="small" data-action="schedule" data-clip-id="' + clip.id + '">Set</button>' +
+            '<button class="small" data-action="clear-schedule" data-clip-id="' + clip.id + '">Clear</button>' +
+          '</div>' +
+          actionsOrReasonPanel(clip, canApprove, canOverride, canReject) +
+        '</div>' +
+      '</div>';
+  }
+
+  // Either the normal action-button row, or (while `pending` targets this clip) an inline
+  // reason/note form — replaces the `window.prompt()` this used to use, so reject/override
+  // are drivable (and testable) as plain form controls rather than a blocking native dialog.
+  function actionsOrReasonPanel(clip, canApprove, canOverride, canReject) {
+    var isReject = pending && pending.clipId === clip.id && pending.kind === 'reject';
+    var isOverride = pending && pending.clipId === clip.id && pending.kind === 'override';
+
+    if (isReject) {
+      return '<div class="reason-panel">' +
+        '<input type="text" class="reason-input" data-clip-id="' + clip.id + '" placeholder="reason for rejecting (required)">' +
+        '<button class="btn-reject small" data-action="confirm-reject" data-clip-id="' + clip.id + '">Confirm reject</button>' +
+        '<button class="small" data-action="cancel-reason" data-clip-id="' + clip.id + '">Cancel</button>' +
+      '</div>';
+    }
+    if (isOverride) {
+      return '<div class="reason-panel">' +
+        '<input type="text" class="reason-input" data-clip-id="' + clip.id + '" placeholder="optional note">' +
+        '<button class="btn-override small" data-action="confirm-override" data-clip-id="' + clip.id + '">Confirm override-approve</button>' +
+        '<button class="small" data-action="cancel-reason" data-clip-id="' + clip.id + '">Cancel</button>' +
+      '</div>';
+    }
+    return '<div class="actions">' +
+      (canApprove ? '<button class="btn-approve" data-action="approve" data-clip-id="' + clip.id + '">Approve</button>' : '') +
+      (canOverride ? '<button class="btn-override" data-action="override" data-clip-id="' + clip.id + '">Override-approve</button>' : '') +
+      (canReject ? '<button class="btn-reject" data-action="reject" data-clip-id="' + clip.id + '">Reject</button>' : '') +
+    '</div>';
+  }
+
+  function render() {
+    renderTabs();
+    var list = filter === 'all' ? clips : clips.filter(function (c) { return c.status === filter; });
+    var grid = document.getElementById('grid');
+    grid.innerHTML = list.length ? list.map(cardHtml).join('') : '<p class="empty">No clips in this view.</p>';
+  }
+
+  function startPolling() {
+    if (pollHandle) return;
+    pollHandle = setInterval(async function () {
+      await refreshJobs();
+      clips.forEach(function (c) {
+        var el = document.querySelector('.card[data-clip-id="' + c.id + '"]');
+        if (el && jobForClip(c.id)) el.outerHTML = cardHtml(c);
+      });
+      if (!anyJobActive()) {
+        clearInterval(pollHandle);
+        pollHandle = null;
+        await refreshAll();
+      }
+    }, 2000);
+  }
+
+  document.getElementById('tabs').addEventListener('click', function (e) {
+    var btn = e.target.closest('button[data-tab]');
+    if (!btn) return;
+    filter = btn.dataset.tab;
+    render();
+  });
+
+  document.getElementById('grid').addEventListener('change', async function (e) {
+    var input = e.target.closest('input[data-action="hook"]');
+    if (!input) return;
+    var id = input.dataset.clipId;
+    var index = Number(input.value);
+    try {
+      await postJson('/api/clips/' + id + '/hook', { index: index });
+      await refreshJobs();
+      render();
+      startPolling();
+    } catch (err) {
+      alert('hook switch failed: ' + err.message);
+      await refreshClips();
+      render();
+    }
+  });
+
+  document.getElementById('grid').addEventListener('click', async function (e) {
+    var btn = e.target.closest('button[data-action]');
+    if (!btn) return;
+    var id = btn.dataset.clipId;
+    var action = btn.dataset.action;
+    try {
+      if (action === 'approve') {
+        await postJson('/api/clips/' + id + '/approve', {});
+      } else if (action === 'override') {
+        pending = { clipId: id, kind: 'override' };
+        render();
+        return;
+      } else if (action === 'reject') {
+        pending = { clipId: id, kind: 'reject' };
+        render();
+        return;
+      } else if (action === 'cancel-reason') {
+        pending = null;
+        render();
+        return;
+      } else if (action === 'confirm-override') {
+        var noteInput = document.querySelector('.reason-input[data-clip-id="' + id + '"]');
+        var note = noteInput ? noteInput.value.trim() : '';
+        pending = null;
+        await postJson('/api/clips/' + id + '/approve', note ? { override: true, note: note } : { override: true });
+      } else if (action === 'confirm-reject') {
+        var reasonInput = document.querySelector('.reason-input[data-clip-id="' + id + '"]');
+        var reason = reasonInput ? reasonInput.value.trim() : '';
+        if (!reason) { alert('a reason is required'); return; }
+        pending = null;
+        await postJson('/api/clips/' + id + '/reject', { reason: reason });
+      } else if (action === 'save-title') {
+        var titleInput = document.querySelector('.title-input[data-clip-id="' + id + '"]');
+        await postJson('/api/clips/' + id + '/title', { title: titleInput.value });
+      } else if (action === 'schedule') {
+        var schedInput = document.querySelector('.schedule-input[data-clip-id="' + id + '"]');
+        if (!schedInput.value) { alert('pick a date/time first'); return; }
+        await postJson('/api/clips/' + id + '/schedule', { publishAt: new Date(schedInput.value).toISOString() });
+      } else if (action === 'clear-schedule') {
+        await postJson('/api/clips/' + id + '/schedule', { publishAt: null });
+      } else {
+        return;
+      }
+      await refreshAll();
+    } catch (err) {
+      alert(action + ' failed: ' + err.message);
+    }
+  });
+
+  (async function init() {
+    await refreshAll();
+    if (anyJobActive()) startPolling();
+  })();
+})();
+</script>
+</body>
+</html>

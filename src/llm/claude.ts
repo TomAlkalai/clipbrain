@@ -94,20 +94,10 @@ async function spawnClaude(args: string[], opts: { cwd: string; input: string; t
   }
 }
 
-export const claudeBackend: Backend = async ({ model, system, prompt, schema }) => {
-  const cwd = path.join(DATA, '.llm-sandbox');
-  fs.mkdirSync(cwd, { recursive: true });
-  const args = [
-    '-p', '--model', model,
-    '--output-format', 'json',
-    '--json-schema', JSON.stringify(schema),
-    '--tools', '',
-    '--safe-mode',
-    '--no-session-persistence',
-    '--strict-mcp-config',
-    '--system-prompt', system,
-  ];
-  const r = await spawnClaude(args, { cwd, input: prompt, timeoutMs: 15 * 60_000 });
+// Parses one `claude -p --output-format json` result: shared by the text-only path (no tools)
+// and the vision path (`--tools Read`) below, so the structured_output / error / cost
+// extraction logic exists exactly once.
+function parseClaudeResult(r: RunResult): { output: unknown; costUsd: number } {
   let j: any;
   try {
     j = JSON.parse(r.stdout);
@@ -119,4 +109,53 @@ export const claudeBackend: Backend = async ({ model, system, prompt, schema }) 
   }
   const output = j.structured_output ?? JSON.parse(j.result);
   return { output, costUsd: Number(j.total_cost_usd ?? 0) };
+}
+
+export type ClaudeCallOpts = {
+  model: string;
+  system: string;
+  prompt: string;
+  schema: object;
+  /** '' for no tools (text-only calls); 'Read' to let the CLI read local image files (vision calls). */
+  tools: string;
+  /** Directory the CLI is allowed to read from beyond its sandbox cwd — required when tools is 'Read'. */
+  addDir?: string;
 };
+
+// One spawn + parse function shared by claudeBackend (text, no tools) and claudeVisionCall
+// (vision, --tools Read --add-dir <images dir>) — same CLI flags, cwd, timeout and result
+// parsing either way; only the tool access differs.
+async function callClaude(o: ClaudeCallOpts): Promise<{ output: unknown; costUsd: number }> {
+  const cwd = path.join(DATA, '.llm-sandbox');
+  fs.mkdirSync(cwd, { recursive: true });
+  const args = [
+    '-p', '--model', o.model,
+    '--output-format', 'json',
+    '--json-schema', JSON.stringify(o.schema),
+    '--tools', o.tools,
+  ];
+  if (o.addDir) args.push('--add-dir', o.addDir);
+  args.push(
+    '--safe-mode',
+    '--no-session-persistence',
+    '--strict-mcp-config',
+    '--system-prompt', o.system,
+  );
+  const r = await spawnClaude(args, { cwd, input: o.prompt, timeoutMs: 15 * 60_000 });
+  return parseClaudeResult(r);
+}
+
+export const claudeBackend: Backend = async ({ model, system, prompt, schema }) =>
+  callClaude({ model, system, prompt, schema, tools: '' });
+
+// Used by llm/vision.ts's llmVisionJson. Grants Read access (only) plus `--add-dir` for the
+// directory holding the candidate's keyframe images, so the CLI can open them by absolute path.
+export async function claudeVisionCall(req: {
+  model: string;
+  system: string;
+  prompt: string;
+  schema: object;
+  addDir: string;
+}): Promise<{ output: unknown; costUsd: number }> {
+  return callClaude({ ...req, tools: 'Read' });
+}

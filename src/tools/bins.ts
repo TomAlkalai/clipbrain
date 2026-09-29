@@ -32,12 +32,24 @@ export function whisperDir(): string {
   return path.join(BIN, 'whisper.cpp');
 }
 
-export function whisperModel(): string {
-  return env('CB_WHISPER_MODEL', 'base.en')!;
+// whisper.cpp v1.9.2 build — used for actual transcription (R7): ~3x+ realtime on this CPU vs
+// ~0.3x for the 1.5.5 build in whisperDir(). whisperDir() is still used as the model folder
+// (holds ggml-base.en.bin) since the model files are version-independent.
+export function whisper192Dir(): string {
+  return path.join(BIN, 'whisper-1.9.2');
 }
 
-function whisperExe(): string {
-  return path.join(whisperDir(), 'main.exe');
+// Source layout for whisper.cpp 1.9.2, pre-built for this machine (Windows, with DTW token
+// timestamps + -nfa support). Copied into whisper192Dir() by `setup` if not already there.
+const WHISPER_192_SOURCE =
+  'C:\\Users\\tomal\\AppData\\Local\\Temp\\claude\\C--Users-tomal-OneDrive-Desktop-Youtube\\5498a539-3d58-485b-a8c3-60fe8e207a0b\\scratchpad\\feasibility\\w192layout';
+
+export function whisper192Exe(): string {
+  return path.join(whisper192Dir(), 'build', 'bin', 'whisper-cli.exe');
+}
+
+export function whisperModel(): string {
+  return env('CB_WHISPER_MODEL', 'base.en')!;
 }
 
 function whisperModelPath(): string {
@@ -76,6 +88,23 @@ export async function setup(): Promise<void> {
   fs.mkdirSync(whisperDir(), { recursive: true });
   await installWhisperCpp({ to: whisperDir(), version: '1.5.5' });
   await downloadWhisperModel({ model: whisperModel() as WhisperModel, folder: whisperDir() });
+
+  if (!fs.existsSync(whisper192Exe())) {
+    if (fs.existsSync(WHISPER_192_SOURCE)) {
+      log('copying whisper.cpp 1.9.2 build into bin/whisper-1.9.2...');
+      fs.mkdirSync(whisper192Dir(), { recursive: true });
+      fs.cpSync(WHISPER_192_SOURCE, whisper192Dir(), { recursive: true });
+      log('whisper.cpp 1.9.2 copied');
+    } else {
+      throw new Error(
+        `whisper.cpp 1.9.2 is missing (${whisper192Exe()}) and the source layout was not found at ${WHISPER_192_SOURCE}. ` +
+          'Build or obtain a whisper.cpp 1.9.2 Windows build with DTW token-timestamp support and copy it into bin/whisper-1.9.2 ' +
+          '(so that bin/whisper-1.9.2/build/bin/whisper-cli.exe exists) manually.',
+      );
+    }
+  } else {
+    log('whisper.cpp 1.9.2 already present');
+  }
 
   const facePath = ultrafaceModel();
   if (!fs.existsSync(facePath)) {
@@ -138,18 +167,20 @@ export async function doctor(): Promise<DoctorRow[]> {
   }
 
   {
-    const exePath = whisperExe();
+    // Transcription uses the 1.9.2 build (R7); whisperDir() (1.5.5) is kept only as the model
+    // folder — ggml-base.en.bin is version-independent.
+    const exe192Path = whisper192Exe();
     const modelPath = whisperModelPath();
-    const exeOk = fs.existsSync(exePath);
+    const exe192Ok = fs.existsSync(exe192Path);
     const modelOk = fs.existsSync(modelPath);
-    const ok = exeOk && modelOk;
+    const ok = exe192Ok && modelOk;
     const missing: string[] = [];
-    if (!exeOk) missing.push(exePath);
+    if (!exe192Ok) missing.push(exe192Path);
     if (!modelOk) missing.push(modelPath);
     rows.push({
       name: 'whisper.cpp',
       ok,
-      detail: ok ? `${exePath}, ${modelPath}` : `missing: ${missing.join(', ')}`,
+      detail: ok ? `${exe192Path}, ${modelPath}` : `missing: ${missing.join(', ')}`,
     });
   }
 
