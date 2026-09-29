@@ -1,6 +1,14 @@
 # Ranking Benchmark — Design Spec (2026-09-29)
 
-**Status: proposed, awaiting approval. Not built.** Addresses HANDOFF open item #5 (ranking precision).
+**Status: proposed, awaiting approval.** Addresses HANDOFF open item #5 (ranking precision).
+
+The parts that don't depend on the §13 decisions and spend no LLM credits are built in a draft follow-up PR:
+- the pure metrics (§4–§5);
+- folds and the leakage guard (§6);
+- the offline `cb bench dataset` command (§3);
+- the `buildPool` extraction (§7).
+
+Stages 1–3 (pools, rank variants, report) are not built.
 
 ## 1. Problem
 
@@ -83,7 +91,7 @@ For each episode:
 - metrics are averaged over episodes, with 95 % confidence intervals from a bootstrap over episodes (10,000 resamples, seeded);
 - variant comparisons use a **paired** bootstrap of per-episode differences, since every variant ranks the same pools;
 - two reference lines are always reported:
-  - a random-order baseline (the analytic expectation over permutations of `P`);
+  - a random-order baseline (the expected score over random orderings of `P`, estimated with a seeded simulation);
   - an oracle that puts every relevant candidate first (equal to 1.0 for nDCG | pool; shown for R@6 and P@6).
 
 **Noise floor.** The claude CLI exposes no temperature or seed. The production ranker (V0) is therefore re-run 3× with the cache off. The spread of its paired differences against itself is the noise floor, and a variant has to clear it.

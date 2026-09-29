@@ -22,6 +22,7 @@ import { ensureHires, renderClip, truncateEdl } from './render/render.js';
 import { qcClip } from './qc/qc.js';
 import { produceSource, requalifyClip, requalifySource, runPipeline, scout } from './produce.js';
 import { evalSource } from './eval.js';
+import { buildDataset, datasetPath, MIN_PUNCTUATION_DENSITY } from './bench/dataset.js';
 import { createReviewServer } from './review/server.js';
 import { authorize } from './publish/oauth.js';
 import { publish } from './publish/youtube.js';
@@ -815,6 +816,43 @@ export const commands: Record<string, { help: string; run: (a: ParsedArgs) => Pr
       }
       const n = await collectStats();
       log(`stats: updated ${n} clip(s)`);
+    },
+  },
+  bench: {
+    help: 'bench dataset <slug> [--folds 3] [--min-age-days 21] — build the offline ranking-benchmark dataset from mining outputs (no network, no LLM).',
+    async run(a) {
+      const [sub, slug] = a._;
+      if (sub !== 'dataset' || !slug) {
+        log('usage: cb bench dataset <slug> [--folds 3] [--min-age-days 21]');
+        process.exitCode = 1;
+        return;
+      }
+      const folds = Number(asString(a.flags.folds) ?? 3) || 3;
+      const minAgeDays = Number(asString(a.flags['min-age-days']) ?? 21);
+      const ds = buildDataset(slug, { folds, minAgeDays: Number.isFinite(minAgeDays) ? minAgeDays : 21 });
+      console.log('episode'.padEnd(13), 'fold', 'young'.padEnd(6), 'moments', 'words'.padStart(7), 'punct'.padStart(6), 'seg'.padEnd(11), 'title');
+      for (const e of ds.episodes) {
+        const t = e.transcript;
+        console.log(
+          e.episodeId.padEnd(13),
+          String(e.fold).padEnd(4),
+          String(e.young ?? '?').padEnd(6),
+          String(e.moments.length).padEnd(7),
+          String(t?.words ?? '-').padStart(7),
+          (t ? `${(t.punctuationDensity * 100).toFixed(1)}%` : '-').padStart(6),
+          (t?.segmentation ?? 'NO SUBS').padEnd(11),
+          e.title.slice(0, 50),
+        );
+      }
+      const sm = ds.summary;
+      const pd = sm.medianPunctuationDensity;
+      console.log(
+        `\n${sm.episodes} episodes, ${sm.moments} official moments, folds ${sm.perFold.join('/')}, ${sm.young} young (<${ds.minAgeDays} d), ` +
+          `${sm.missingTranscripts} without cached subtitles, median punctuation ${pd === null ? '-' : `${(pd * 100).toFixed(1)}%`}`,
+      );
+      if (sm.missingTranscripts > 0) log(`warning: ${sm.missingTranscripts} episode(s) have no cached subtitles — re-run \`cb mine ${slug}\` to fetch them`);
+      if (pd !== null && pd < MIN_PUNCTUATION_DENSITY) log('note: captions are mostly unpunctuated — the benchmark will use gap-based sentence splits (design §3)');
+      log(`wrote ${datasetPath(slug)}`);
     },
   },
   learn: {
