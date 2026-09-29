@@ -428,3 +428,34 @@ export async function scout(slug: string, o?: { latest?: number; minDurationSec?
   const picked = pickNewEpisodes(list, existing, latest, minDurationSec);
   return picked.map((e) => canonicalWatchUrl(e.id));
 }
+
+export type RunLatestDeps = { scout: typeof scout; runPipeline: typeof runPipeline };
+export type RunLatestResult = { scouted: number; succeeded: string[]; failed: { url: string; error: string }[] };
+
+/**
+ * `run --creator <slug> --latest N`: scouts new episodes and runs the full pipeline on each,
+ * sequentially. This is the unattended path, so one episode failing (a transient network error
+ * during ingest, a whisper crash) is logged and the rest still run — the caller reports the
+ * failures and exits non-zero. An episode that failed during ingest leaves no source behind, so
+ * the next `run --latest` scouts it again; one that failed later already has a source (which
+ * scout skips), and `run <url>` resumes it — every stage picks up from what's on disk.
+ */
+export async function runLatest(
+  slug: string,
+  o: { latest: number; top: number },
+  deps: RunLatestDeps = { scout, runPipeline },
+): Promise<RunLatestResult> {
+  const urls = await deps.scout(slug, { latest: o.latest });
+  const result: RunLatestResult = { scouted: urls.length, succeeded: [], failed: [] };
+  for (const url of urls) {
+    try {
+      await deps.runPipeline(url, slug, { top: o.top });
+      result.succeeded.push(url);
+    } catch (err) {
+      const error = err instanceof Error ? err.message : String(err);
+      log(`run ${slug}: episode ${url} failed, continuing with the next one: ${error}`);
+      result.failed.push({ url, error });
+    }
+  }
+  return result;
+}

@@ -1,5 +1,5 @@
 import { it, expect } from 'vitest';
-import { attribution, planClip, pickNewEpisodes } from '../src/produce.js';
+import { attribution, planClip, pickNewEpisodes, runLatest } from '../src/produce.js';
 import type { Source, Creator, Candidate, Sentence, RefShort } from '../src/types.js';
 import type { GeneratedHooks } from '../src/hooks/hooks.js';
 
@@ -180,4 +180,28 @@ it('attribution links the canonical episode URL, never the raw pasted one (list=
   const pasted: Source = { ...source, url: 'https://www.youtube.com/watch?v=abc123&list=PLx&t=42s&si=trackingToken' };
   expect(attribution(pasted, creator)).toContain('Full episode: https://www.youtube.com/watch?v=abc123');
   expect(attribution(pasted, creator)).not.toContain('si=');
+});
+
+// Review finding: `run --latest N` is the unattended path, but one episode failing (a transient
+// yt-dlp/network error during ingest, say) used to abort every episode after it.
+it('runLatest keeps going after an episode fails and reports which ones did', async () => {
+  const ran: string[] = [];
+  const r = await runLatest('doac', { latest: 3, top: 6 }, {
+    scout: async () => ['u1', 'u2', 'u3'],
+    runPipeline: async (url) => {
+      ran.push(url);
+      if (url === 'u2') throw new Error('yt-dlp: HTTP Error 403');
+    },
+  });
+  expect(ran).toEqual(['u1', 'u2', 'u3']);
+  expect(r).toEqual({ scouted: 3, succeeded: ['u1', 'u3'], failed: [{ url: 'u2', error: 'yt-dlp: HTTP Error 403' }] });
+});
+it('runLatest passes creator and top through, and handles nothing scouted', async () => {
+  const calls: unknown[] = [];
+  const r = await runLatest('doac', { latest: 2, top: 4 }, {
+    scout: async (slug, o) => { calls.push([slug, o]); return []; },
+    runPipeline: async () => { throw new Error('not called'); },
+  });
+  expect(calls).toEqual([['doac', { latest: 2 }]]);
+  expect(r).toEqual({ scouted: 0, succeeded: [], failed: [] });
 });

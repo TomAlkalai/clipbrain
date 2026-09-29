@@ -20,7 +20,7 @@ import { generateHooks } from './hooks/hooks.js';
 import { buildEdl } from './edit/edl.js';
 import { ensureHires, renderClip, truncateEdl } from './render/render.js';
 import { qcClip } from './qc/qc.js';
-import { produceSource, requalifyClip, requalifySource, runPipeline, scout } from './produce.js';
+import { produceSource, requalifyClip, requalifySource, runPipeline, runLatest, scout } from './produce.js';
 import { evalSource } from './eval.js';
 import { createReviewServer } from './review/server.js';
 import { authorize } from './publish/oauth.js';
@@ -713,15 +713,14 @@ export const commands: Record<string, { help: string; run: (a: ParsedArgs) => Pr
         return;
       }
       const latest = Number(latestStr) || 3;
-      const urls = await scout(creator, { latest });
-      if (urls.length === 0) {
+      const r = await runLatest(creator, { latest, top });
+      if (r.scouted === 0) {
         log(`run ${creator}: scout found no new episodes (>= 900s, not yet ingested)`);
         return;
       }
-      log(`run ${creator}: scouted ${urls.length} episode(s), running the pipeline on each sequentially`);
-      for (const url of urls) {
-        await runPipeline(url, creator, { top });
-      }
+      log(`run ${creator}: ${r.succeeded.length}/${r.scouted} episode(s) completed`);
+      for (const f of r.failed) log(`  FAILED ${f.url}: ${f.error} — resume with: cb run ${f.url} --creator ${creator}`);
+      if (r.failed.length > 0) process.exitCode = 1;
     },
   },
   eval: {
