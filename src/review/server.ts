@@ -331,7 +331,32 @@ function scheduleClip(id: string, body: any): Result {
 const CLIP_ACTION_RE = /^\/api\/clips\/([^/]+)\/(approve|reject|hook|title|schedule)$/;
 const MEDIA_RE = /^\/media\/clips\/([^/]+)\/(render\.mp4|poster\.jpg)$/;
 
+const LOOPBACK_HOSTNAMES = new Set(['127.0.0.1', 'localhost', '[::1]']);
+
+/**
+ * Binding to 127.0.0.1 alone doesn't stop a web page open in the user's browser from driving this
+ * API. A foreign Host header means DNS rebinding (an attacker domain resolved to 127.0.0.1); a
+ * foreign Origin on a state-changing request means a cross-site form/fetch POST. Both are refused.
+ * Browsers always send Origin on cross-origin POSTs; same-origin UI requests and non-browser
+ * clients (curl, tests) may omit it and are allowed. Pure.
+ */
+export function isAllowedRequest(method: string, host: string | undefined, origin: string | undefined, serverPort: number): boolean {
+  const hostname = /^(\[[^\]]+\]|[^:]+)(?::\d+)?$/.exec((host ?? '').trim().toLowerCase())?.[1];
+  if (!hostname || !LOOPBACK_HOSTNAMES.has(hostname)) return false;
+  if (method === 'GET' || method === 'HEAD' || origin === undefined) return true;
+  try {
+    const o = new URL(origin);
+    return LOOPBACK_HOSTNAMES.has(o.hostname) && Number(o.port) === serverPort;
+  } catch {
+    return false; // e.g. "null" from a sandboxed iframe or file:// page
+  }
+}
+
 async function handleRequest(req: http.IncomingMessage, res: http.ServerResponse): Promise<void> {
+  if (!isAllowedRequest(req.method ?? 'GET', req.headers.host, req.headers.origin, req.socket.localPort ?? 0)) {
+    sendJson(res, 403, { error: 'forbidden: this API only accepts requests from the local review UI' });
+    return;
+  }
   const u = new URL(req.url ?? '/', 'http://127.0.0.1');
   const pathname = u.pathname;
 
