@@ -54,11 +54,115 @@ export type ProbeDurationFn = (file: string) => Promise<number>;
 
 const HIRES_DURATION_TOLERANCE_SEC = 0.6;
 
+// Windows reports a rename over a file another process still has open as EBUSY or EPERM (and
+// EACCES in some sharing-violation cases — graceful-fs retries the same three). Holders are
+// transient: Remotion's compositor right after the previous render, a video player, an AV scan.
+const FILE_LOCK_CODES = new Set(['EBUSY', 'EPERM', 'EACCES']);
+/** Backoff between rename attempts (~6.3 s in total before giving up). */
+export const RENAME_RETRY_DELAYS_MS = [100, 200, 400, 800, 1600, 3200];
+
+const HIRES_TMP_PREFIX = 'hires.tmp-';
+/**
+ * A `hires.tmp-*` file older than this is an orphan from a hard-killed run. Twice yt-dlp's
+ * 15-min section-download timeout (SECTION_TIMEOUT_MS in yt/ytdlp.ts), and yt-dlp keeps
+ * touching its in-flight files, so a live download from another process is never swept.
+ */
+export const STALE_HIRES_TMP_MS = 30 * 60 * 1000;
+
+export type RenameFn = (from: string, to: string) => void;
+export type SleepFn = (ms: number) => Promise<void>;
+/** Injected in tests; production uses the real fs, timers and clock. */
+export type HiresFsDeps = { rename?: RenameFn; sleep?: SleepFn; retryDelaysMs?: number[]; now?: () => number };
+
+const realSleep: SleepFn = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+
+function lockCode(err: unknown): string | null {
+  const code = (err as { code?: unknown } | null)?.code;
+  return typeof code === 'string' && FILE_LOCK_CODES.has(code) ? code : null;
+}
+
+/**
+ * `rename(from, to)`, retried with backoff while `to` is locked by another process. Any other
+ * error is thrown at once; a lock that outlasts every retry becomes a clear "locked" error.
+ */
+export async function renameWithRetry(
+  from: string,
+  to: string,
+  o: { rename?: RenameFn; sleep?: SleepFn; delaysMs?: number[] } = {},
+): Promise<void> {
+  const rename = o.rename ?? fs.renameSync;
+  const sleep = o.sleep ?? realSleep;
+  const delays = o.delaysMs ?? RENAME_RETRY_DELAYS_MS;
+  for (let attempt = 0; ; attempt++) {
+    try {
+      rename(from, to);
+      return;
+    } catch (err) {
+      const code = lockCode(err);
+      if (!code) throw err;
+      if (attempt >= delays.length) {
+        throw new Error(
+          `${to} is locked by another process (${code}) after ${attempt + 1} attempts — close whatever has it open ` +
+            `(a video player, Explorer preview) and retry`,
+          { cause: err },
+        );
+      }
+      log(`${path.basename(to)} is locked (${code}); retrying the rename in ${delays[attempt]} ms (${attempt + 1}/${delays.length})`);
+      await sleep(delays[attempt]);
+    }
+  }
+}
+
+/**
+ * Removes `hires.tmp-*` files in `dir` last modified more than `maxAgeMs` before `now` —
+ * orphans (including yt-dlp's `.part`/`.fNNN` intermediates) from a run that was hard-killed
+ * before its own cleanup ran. Returns the removed file names; a missing dir is a no-op.
+ */
+export function sweepStaleHiresTmp(dir: string, now: number, maxAgeMs = STALE_HIRES_TMP_MS): string[] {
+  if (!fs.existsSync(dir)) return [];
+  const removed: string[] = [];
+  for (const name of fs.readdirSync(dir)) {
+    if (!name.startsWith(HIRES_TMP_PREFIX)) continue;
+    const p = path.join(dir, name);
+    try {
+      if (now - fs.statSync(p).mtimeMs <= maxAgeMs) continue;
+      fs.rmSync(p, { force: true });
+      removed.push(name);
+    } catch {
+      // Gone already, or locked by a process that is still using it: leave it for next time.
+    }
+  }
+  return removed;
+}
+
+/**
+ * Removes every file in `dir` whose name starts with `prefix`. Best effort and never throws: it
+ * runs while handling another error, which must not be masked by a cleanup failure (a temp file
+ * that is itself locked is left for sweepStaleHiresTmp).
+ */
+function removeByPrefix(dir: string, prefix: string): void {
+  let names: string[] = [];
+  try {
+    names = fs.readdirSync(dir);
+  } catch {
+    return;
+  }
+  for (const name of names) {
+    if (!name.startsWith(prefix)) continue;
+    try {
+      fs.rmSync(path.join(dir, name), { force: true });
+    } catch {
+      // see above
+    }
+  }
+}
+
 /**
  * Downloads (via `download`) into a fresh temp file next to `hiresPath`, verifies its duration
  * against the expected `[windowStart, windowEnd)` window, and only then atomically renames it
  * over `hiresPath`. On any failure — the download itself, or a duration mismatch — the temp file
- * is removed and `hiresPath` (if it already existed) is left untouched.
+ * (and any yt-dlp intermediates it left) is removed and `hiresPath` (if it already existed) is
+ * left untouched.
  *
  * Root-cause fix (Bug 2, important): `ensureHires`'s YouTube branch used to call
  * `downloadSection(url, start, end, hiresPath)` directly onto an EXISTING hires.mp4. yt-dlp sees
@@ -69,8 +173,12 @@ const HIRES_DURATION_TOLERANCE_SEC = 0.6;
  * itself) means yt-dlp/ffmpeg always writes a real, fresh file, which is verified before it ever
  * replaces the one downstream code depends on.
  *
- * `download`/`probeDuration` are injected so this is unit-testable with no network and no real
- * media files (see tests/render.test.ts).
+ * The final rename is retried with backoff while `hiresPath` is locked (Windows EBUSY/EPERM —
+ * see renameWithRetry), so a briefly-held file no longer throws away a good download. Stale
+ * `hires.tmp-*` orphans from hard-killed runs are swept first (sweepStaleHiresTmp).
+ *
+ * `download`/`probeDuration` (and, in tests, rename/sleep/clock via `deps`) are injected so this
+ * is unit-testable with no network and no real media files (see tests/render.test.ts).
  */
 export async function fetchAndReplaceHires(
   hiresPath: string,
@@ -78,10 +186,15 @@ export async function fetchAndReplaceHires(
   windowEnd: number,
   download: DownloadHires,
   probeDuration: ProbeDurationFn,
+  deps: HiresFsDeps = {},
 ): Promise<void> {
   const dir = path.dirname(hiresPath);
   fs.mkdirSync(dir, { recursive: true });
-  const tmpPath = path.join(dir, `hires.tmp-${crypto.randomBytes(6).toString('hex')}.mp4`);
+  const swept = sweepStaleHiresTmp(dir, (deps.now ?? Date.now)());
+  if (swept.length > 0) log(`removed ${swept.length} stale hi-res temp file(s) in ${dir}: ${swept.join(', ')}`);
+
+  const tmpBase = `${HIRES_TMP_PREFIX}${crypto.randomBytes(6).toString('hex')}`;
+  const tmpPath = path.join(dir, `${tmpBase}.mp4`);
   try {
     await download(windowStart, windowEnd, tmpPath);
 
@@ -93,9 +206,9 @@ export async function fetchAndReplaceHires(
       );
     }
 
-    fs.renameSync(tmpPath, hiresPath);
+    await renameWithRetry(tmpPath, hiresPath, { rename: deps.rename, sleep: deps.sleep, delaysMs: deps.retryDelaysMs });
   } catch (err) {
-    if (fs.existsSync(tmpPath)) fs.rmSync(tmpPath, { force: true });
+    removeByPrefix(dir, tmpBase);
     throw err;
   }
 }

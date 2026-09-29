@@ -1,7 +1,7 @@
 import { it, expect } from 'vitest';
 import fs from 'node:fs'; import os from 'node:os'; import path from 'node:path';
 import { startStaticServer } from '../src/render/static.js';
-import { parseLoudnorm, parseEbur128Summary, masterRetryPlan, truncateEdl, fetchAndReplaceHires } from '../src/render/render.js';
+import { parseLoudnorm, parseEbur128Summary, masterRetryPlan, truncateEdl, fetchAndReplaceHires, renameWithRetry, sweepStaleHiresTmp, RENAME_RETRY_DELAYS_MS, STALE_HIRES_TMP_MS } from '../src/render/render.js';
 import type { Edl } from '../src/types.js';
 it('serves byte ranges', async () => {
   const d = fs.mkdtempSync(path.join(os.tmpdir(), 'cbs-')); fs.writeFileSync(path.join(d, 'a.mp4'), Buffer.from('0123456789'));
@@ -169,4 +169,114 @@ it('fetchAndReplaceHires: creates the clip dir when it does not exist yet, and s
     async () => 5,
   );
   expect(fs.readFileSync(hiresPath, 'utf8')).toBe('FIRST');
+});
+
+// ---- HANDOFF #1: Windows file locks on the hires.mp4 rename + stale temp files ----
+// On Windows, renaming over hires.mp4 fails with EBUSY/EPERM (or EACCES) while another process
+// still has it open — e.g. Remotion's compositor shortly after the previous render, a video
+// player or an antivirus scan. The rename used to fail at once and discard a good download.
+// rename/sleep/now are injected so this runs with no real locks and no real waiting.
+const lockErr = (code: string) => Object.assign(new Error(`${code}: resource busy or locked, rename`), { code, syscall: 'rename' });
+const flakyRename = (codes: string[]) => {
+  let calls = 0;
+  return {
+    get calls() { return calls; },
+    rename: (from: string, to: string) => {
+      const code = codes[calls++];
+      if (code) throw lockErr(code);
+      fs.renameSync(from, to);
+    },
+  };
+};
+
+it('renameWithRetry: retries EBUSY/EPERM/EACCES with backoff, then renames', async () => {
+  const dir = mkTmpClipDir();
+  fs.writeFileSync(path.join(dir, 'a'), 'A');
+  const r = flakyRename(['EBUSY', 'EPERM', 'EACCES']);
+  const slept: number[] = [];
+  await renameWithRetry(path.join(dir, 'a'), path.join(dir, 'b'), { rename: r.rename, sleep: async (ms) => { slept.push(ms); } });
+  expect(fs.readFileSync(path.join(dir, 'b'), 'utf8')).toBe('A');
+  expect(r.calls).toBe(4);
+  expect(slept).toEqual(RENAME_RETRY_DELAYS_MS.slice(0, 3));
+  expect(slept).toEqual([...slept].sort((x, y) => x - y)); // backoff never shrinks
+});
+
+it('renameWithRetry: does not retry errors that are not file locks', async () => {
+  const slept: number[] = [];
+  await expect(renameWithRetry('/x', '/y', {
+    rename: () => { throw Object.assign(new Error('EXDEV: cross-device link'), { code: 'EXDEV' }); },
+    sleep: async (ms) => { slept.push(ms); },
+  })).rejects.toThrow(/EXDEV/);
+  expect(slept).toEqual([]);
+});
+
+it('renameWithRetry: gives up after the last backoff step with a clear "locked" error', async () => {
+  const slept: number[] = [];
+  let calls = 0;
+  await expect(renameWithRetry('/x', '/y', {
+    rename: () => { calls++; throw lockErr('EBUSY'); },
+    sleep: async (ms) => { slept.push(ms); },
+    delaysMs: [1, 2, 3],
+  })).rejects.toThrow(/\/y is locked by another process \(EBUSY\) after 4 attempts/);
+  expect(calls).toBe(4);
+  expect(slept).toEqual([1, 2, 3]);
+});
+
+it('fetchAndReplaceHires: keeps a good download when hires.mp4 is briefly locked', async () => {
+  const dir = mkTmpClipDir();
+  const hiresPath = path.join(dir, 'hires.mp4');
+  fs.writeFileSync(hiresPath, 'STALE');
+  const r = flakyRename(['EBUSY', 'EBUSY']);
+  await fetchAndReplaceHires(hiresPath, 0, 10, async (_s, _e, out) => fs.writeFileSync(out, 'FRESH'), async () => 10,
+    { rename: r.rename, sleep: async () => {} });
+  expect(fs.readFileSync(hiresPath, 'utf8')).toBe('FRESH');
+  expect(r.calls).toBe(3);
+  expect(tmpLeftovers(dir)).toEqual([]);
+});
+
+it('fetchAndReplaceHires: when the lock never clears, leaves hires.mp4 untouched and cleans up', async () => {
+  const dir = mkTmpClipDir();
+  const hiresPath = path.join(dir, 'hires.mp4');
+  fs.writeFileSync(hiresPath, 'ORIGINAL');
+  await expect(fetchAndReplaceHires(hiresPath, 0, 10, async (_s, _e, out) => fs.writeFileSync(out, 'FRESH'), async () => 10,
+    { rename: () => { throw lockErr('EPERM'); }, sleep: async () => {}, retryDelaysMs: [1] })).rejects.toThrow(/locked/);
+  expect(fs.readFileSync(hiresPath, 'utf8')).toBe('ORIGINAL');
+  expect(tmpLeftovers(dir)).toEqual([]);
+});
+
+it('fetchAndReplaceHires: a failed download also removes its own yt-dlp intermediates', async () => {
+  const dir = mkTmpClipDir();
+  const hiresPath = path.join(dir, 'hires.mp4');
+  await expect(fetchAndReplaceHires(hiresPath, 0, 10, async (_s, _e, out) => {
+    const base = out.replace(/\.mp4$/, '');
+    fs.writeFileSync(`${base}.f137.mp4.part`, 'partial video');
+    fs.writeFileSync(`${base}.f140.m4a`, 'audio');
+    throw new Error('yt-dlp: Failed to fetch');
+  }, async () => 10)).rejects.toThrow('Failed to fetch');
+  expect(tmpLeftovers(dir)).toEqual([]);
+});
+
+it('sweepStaleHiresTmp: removes old hires.tmp-* leftovers (incl. yt-dlp intermediates), keeps fresh ones and everything else', () => {
+  const dir = mkTmpClipDir();
+  const now = Date.now();
+  const old = (now - STALE_HIRES_TMP_MS - 60_000) / 1000;
+  const files = ['hires.tmp-aaa.mp4', 'hires.tmp-bbb.f137.mp4.part', 'hires.tmp-bbb.f140.m4a', 'hires.tmp-new.mp4', 'hires.mp4', 'render.mp4', 'clip.json'];
+  for (const f of files) fs.writeFileSync(path.join(dir, f), f);
+  for (const f of files.filter((x) => x !== 'hires.tmp-new.mp4')) fs.utimesSync(path.join(dir, f), old, old);
+  expect(sweepStaleHiresTmp(dir, now).sort()).toEqual(['hires.tmp-aaa.mp4', 'hires.tmp-bbb.f137.mp4.part', 'hires.tmp-bbb.f140.m4a']);
+  expect(fs.readdirSync(dir).sort()).toEqual(['clip.json', 'hires.mp4', 'hires.tmp-new.mp4', 'render.mp4']);
+});
+
+it('sweepStaleHiresTmp: a missing dir is a no-op', () => {
+  expect(sweepStaleHiresTmp(path.join(mkTmpClipDir(), 'nope'), Date.now())).toEqual([]);
+});
+
+it('fetchAndReplaceHires: sweeps stale temp files left by an earlier hard-killed run', async () => {
+  const dir = mkTmpClipDir();
+  const hiresPath = path.join(dir, 'hires.mp4');
+  fs.writeFileSync(path.join(dir, 'hires.tmp-dead.mp4'), 'orphan');
+  const now = Date.now() + STALE_HIRES_TMP_MS + 60_000;
+  await fetchAndReplaceHires(hiresPath, 0, 5, async (_s, _e, out) => fs.writeFileSync(out, 'FRESH'), async () => 5, { now: () => now });
+  expect(fs.readFileSync(hiresPath, 'utf8')).toBe('FRESH');
+  expect(tmpLeftovers(dir)).toEqual([]);
 });
