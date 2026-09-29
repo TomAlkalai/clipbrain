@@ -9,7 +9,7 @@ import { loadPlaybook } from './playbook/playbook.js';
 import { ingest } from './ingest.js';
 import { analyzeSource } from './analyze/analyze.js';
 import { selectSource } from './select/select.js';
-import { listChannel } from './yt/ytdlp.js';
+import { listChannel, canonicalWatchUrl } from './yt/ytdlp.js';
 import { mmss } from './select/propose.js';
 import { ledgerSummary } from './llm/llm.js';
 import { isPublished } from './publish/state.js';
@@ -26,7 +26,11 @@ import type { Clip, ClipStatus, Word, Shot, FaceSample, Source, Creator, Candida
  * Pure.
  */
 export function attribution(source: Source, creator: Creator): string {
-  return `\n\nFrom "${source.title}" — ${creator.name}\nFull episode: ${source.url ?? ''}`;
+  // Canonical for YouTube sources, so a URL pasted from a playlist or share link (list=, t=, si=
+  // tracking) never ends up in a public description — including sources ingested before
+  // ingest() started storing the canonical form.
+  const url = source.kind === 'youtube' && source.videoId ? canonicalWatchUrl(source.videoId) : (source.url ?? '');
+  return `\n\nFrom "${source.title}" — ${creator.name}\nFull episode: ${url}`;
 }
 
 /**
@@ -422,5 +426,5 @@ export async function scout(slug: string, o?: { latest?: number; minDurationSec?
   const list = await listChannel(creator.channelUrl, 'videos', latest * 3);
   const existing = existingVideoIdsForCreator(slug);
   const picked = pickNewEpisodes(list, existing, latest, minDurationSec);
-  return picked.map((e) => `https://www.youtube.com/watch?v=${e.id}`);
+  return picked.map((e) => canonicalWatchUrl(e.id));
 }

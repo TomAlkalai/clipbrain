@@ -175,3 +175,9 @@ it('pickNewEpisodes defaults minDur to 900s when omitted', () => {
   const picked = pickNewEpisodes(list, new Set(), 5);
   expect(picked.map((e) => e.id)).toEqual(['b']);
 });
+
+it('attribution links the canonical episode URL, never the raw pasted one (list=, t=, si= stay private)', () => {
+  const pasted: Source = { ...source, url: 'https://www.youtube.com/watch?v=abc123&list=PLx&t=42s&si=trackingToken' };
+  expect(attribution(pasted, creator)).toContain('Full episode: https://www.youtube.com/watch?v=abc123');
+  expect(attribution(pasted, creator)).not.toContain('si=');
+});

@@ -1,7 +1,7 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import { DATA } from './config.js';
-import { videoInfo, downloadAudio, downloadProxy } from './yt/ytdlp.js';
+import { videoInfo, downloadAudio, downloadProxy, canonicalWatchUrl } from './yt/ytdlp.js';
 import { ffmpeg, ffprobe } from './tools/bins.js';
 import { runOk } from './tools/proc.js';
 import { paths, listDirs, readJsonOr, loadCreator, saveSource, newId } from './store.js';
@@ -54,6 +54,9 @@ export async function ingest(input: string, creator: string): Promise<Source> {
       return existing;
     }
 
+    // Stored and downloaded as the canonical watch URL, never the pasted one: a playlist-page URL
+    // would otherwise drive every later download, and `url` is published in clip descriptions.
+    const url = canonicalWatchUrl(info.id);
     const id = newId('src');
     const dir = paths.source(id);
     fs.mkdirSync(dir, { recursive: true });
@@ -62,18 +65,18 @@ export async function ingest(input: string, creator: string): Promise<Source> {
       const proxyPath = path.join(dir, 'proxy.mp4');
 
       const doneAudio = step(`downloading audio (${info.id})`);
-      await downloadAudio(input, audioPath);
+      await downloadAudio(url, audioPath);
       doneAudio();
 
       const doneProxy = step(`downloading proxy (${info.id})`);
-      await downloadProxy(input, proxyPath);
+      await downloadProxy(url, proxyPath);
       doneProxy();
 
       const source: Source = {
         id,
         creator,
         kind: 'youtube',
-        url: input,
+        url,
         videoId: info.id,
         title: info.title,
         durationSec: info.durationSec,

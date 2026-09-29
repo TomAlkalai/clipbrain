@@ -1,5 +1,5 @@
 import { it, expect } from 'vitest';
-import { mapFlatEntries, downloadSectionArgs } from '../src/yt/ytdlp.js';
+import { mapFlatEntries, downloadSectionArgs, downloadAudioArgs, downloadProxyArgs, canonicalWatchUrl } from '../src/yt/ytdlp.js';
 it('maps flat playlist entries', () => {
   const c = 'https://www.youtube.com/@X';
   expect(mapFlatEntries({ entries: [
@@ -21,4 +21,19 @@ it('downloadSectionArgs always includes --force-overwrites, so yt-dlp never skip
   expect(args).toContain('*10-20');
   expect(args[args.length - 1]).toBe('https://youtu.be/x');
   expect(args).toContain('C:/tmp/hires.mp4');
+});
+
+// Review finding: a URL copied from a playlist page (watch?v=ID&list=PL…) made yt-dlp fetch the
+// WHOLE playlist in every single-video download, because only videoInfo passed --no-playlist.
+it('every single-video download passes --no-playlist', () => {
+  const url = 'https://www.youtube.com/watch?v=abc&list=PLx&index=3';
+  expect(downloadAudioArgs(url, 'C:/tmp/a.%(ext)s')).toContain('--no-playlist');
+  expect(downloadProxyArgs(url, 'C:/tmp/proxy.mp4')).toContain('--no-playlist');
+  expect(downloadSectionArgs(url, 1, 2, 'C:/tmp/h.mp4')).toContain('--no-playlist');
+  for (const args of [downloadAudioArgs(url, 'o'), downloadProxyArgs(url, 'o'), downloadSectionArgs(url, 1, 2, 'o')]) {
+    expect(args[args.length - 1]).toBe(url);
+  }
+});
+it('canonicalWatchUrl drops playlist, timestamp and share-tracking parameters', () => {
+  expect(canonicalWatchUrl('Kl-I7sUcAOY')).toBe('https://www.youtube.com/watch?v=Kl-I7sUcAOY');
 });

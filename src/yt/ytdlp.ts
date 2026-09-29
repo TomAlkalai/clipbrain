@@ -193,11 +193,23 @@ export async function fetchSubs(videoId: string): Promise<Word[] | null> {
   }
 }
 
+/** `https://www.youtube.com/watch?v=<id>` — no playlist, timestamp or share-tracking parameters. */
+export function canonicalWatchUrl(videoId: string): string {
+  return `https://www.youtube.com/watch?v=${videoId}`;
+}
+
+// Every single-video download passes --no-playlist: without it, a URL copied from a playlist page
+// (watch?v=ID&list=PL…) makes yt-dlp fetch the whole playlist.
+
+// Pure args builder for downloadAudio.
+export function downloadAudioArgs(url: string, outTemplate: string): string[] {
+  return [...baseArgs(), '--no-playlist', '-f', 'bestaudio', '-o', outTemplate, url];
+}
+
 export async function downloadAudio(url: string, outWav: string): Promise<void> {
   const dir = tmpDir();
   try {
-    const args = [...baseArgs(), '-f', 'bestaudio', '-o', path.join(dir, 'a.%(ext)s'), url];
-    await runOk(ytdlp(), args, { timeoutMs: AUDIO_TIMEOUT_MS });
+    await runOk(ytdlp(), downloadAudioArgs(url, path.join(dir, 'a.%(ext)s')), { timeoutMs: AUDIO_TIMEOUT_MS });
 
     const files = fs.readdirSync(dir).filter((f) => f.startsWith('a.'));
     if (files.length === 0) throw new Error(`yt-dlp produced no audio file for ${url}`);
@@ -212,10 +224,11 @@ export async function downloadAudio(url: string, outWav: string): Promise<void> 
   }
 }
 
-export async function downloadProxy(url: string, outMp4: string): Promise<void> {
-  fs.mkdirSync(path.dirname(outMp4), { recursive: true });
-  const args = [
+// Pure args builder for downloadProxy.
+export function downloadProxyArgs(url: string, outMp4: string): string[] {
+  return [
     ...baseArgs(),
+    '--no-playlist',
     '-f',
     'bv*[height<=360][ext=mp4]/bv*[height<=360]/wv*',
     '--remux-video',
@@ -224,7 +237,11 @@ export async function downloadProxy(url: string, outMp4: string): Promise<void> 
     outMp4,
     url,
   ];
-  await runOk(ytdlp(), args, { timeoutMs: PROXY_TIMEOUT_MS });
+}
+
+export async function downloadProxy(url: string, outMp4: string): Promise<void> {
+  fs.mkdirSync(path.dirname(outMp4), { recursive: true });
+  await runOk(ytdlp(), downloadProxyArgs(url, outMp4), { timeoutMs: PROXY_TIMEOUT_MS });
 }
 
 // Pure args builder for downloadSection — see Bug 2 fix (src/render/render.ts,
@@ -235,6 +252,7 @@ export async function downloadProxy(url: string, outMp4: string): Promise<void> 
 export function downloadSectionArgs(url: string, start: number, end: number, outMp4: string): string[] {
   return [
     ...baseArgs(),
+    '--no-playlist',
     '-f',
     'bv*[height<=1080][ext=mp4]+ba[ext=m4a]/bv*[height<=1080]+ba/b',
     '--download-sections',
