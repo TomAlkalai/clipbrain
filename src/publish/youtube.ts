@@ -6,6 +6,7 @@ import { log } from '../log.js';
 import { getClient } from './oauth.js';
 import type { Clip } from '../types.js';
 import type { OAuth2Client } from 'google-auth-library';
+import { isPublished } from './state.js';
 
 const MAX_TITLE_LEN = 100;
 const MAX_DESCRIPTION_LEN = 4900;
@@ -74,8 +75,9 @@ export function eligibleForPublish(
   const candidates: Clip[] = [];
 
   for (const c of clips) {
-    if (c.status === 'published') {
-      skipped.push({ id: c.id, reason: 'already published' });
+    if (isPublished(c)) {
+      const reason = c.publish && !c.publish.dryRun ? `already published as video ${c.publish.videoId}` : 'already published';
+      skipped.push({ id: c.id, reason });
       continue;
     }
     if (c.status !== 'approved') {

@@ -11,6 +11,7 @@ import { renderClip } from '../render/render.js';
 import { qcClip } from '../qc/qc.js';
 import { ledgerSummary } from '../llm/llm.js';
 import { loadPlaybook, type Playbook } from '../playbook/playbook.js';
+import { isPublished } from '../publish/state.js';
 import type { Clip, ClipStatus, Edl } from '../types.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
@@ -280,6 +281,9 @@ function hookClip(id: string, body: any): Result {
   } catch {
     return notFound(`clip ${id} not found`);
   }
+  // A hook change re-renders the clip, which resets its status: a published clip would drop back
+  // into review and could be approved and uploaded a second time.
+  if (isPublished(clip)) return conflict('cannot change the hook of a published clip — it is already on YouTube');
   const index = body?.index;
   if (typeof index !== 'number' || !Number.isInteger(index) || index < 0 || index >= clip.hooks.length) {
     return badRequest(`index must be an integer in [0, ${clip.hooks.length})`);

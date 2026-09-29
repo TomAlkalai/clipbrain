@@ -293,3 +293,23 @@ it('requalifySource surfaces a per-clip error and continues to the next clip', a
   expect(r1.error).toContain('render exploded');
   expect(r2.error).toBeUndefined();
 });
+
+it('requalifyClip refuses a published clip and touches nothing', async () => {
+  const source = makeSource();
+  const cand = candidate(source, 'cand_pub', 1);
+  setSourceFixtures(source, [cand]);
+  const live = { videoId: 'v1', privacy: 'private', at: new Date().toISOString(), dryRun: false };
+  saveClip(baseClip(source, { id: 'clip_pub', candidateId: cand.id, status: 'published', publish: live }));
+
+  const { calls, deps } = makeStubs();
+  await expect(requalifyClip('clip_pub', deps)).rejects.toThrow(/published/);
+  expect(calls).toEqual([]);
+  expect(loadClip('clip_pub').status).toBe('published');
+});
+
+it('requalifySource refuses --status published outright', async () => {
+  const source = makeSource();
+  const { calls, deps } = makeStubs();
+  await expect(requalifySource(source.id, 'published', deps)).rejects.toThrow(/published/);
+  expect(calls).toEqual([]);
+});

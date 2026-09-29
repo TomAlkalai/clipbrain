@@ -12,6 +12,7 @@ import { selectSource } from './select/select.js';
 import { listChannel } from './yt/ytdlp.js';
 import { mmss } from './select/propose.js';
 import { ledgerSummary } from './llm/llm.js';
+import { isPublished } from './publish/state.js';
 import { log, step } from './log.js';
 import type { Clip, ClipStatus, Word, Shot, FaceSample, Source, Creator, Candidate, Sentence, RefShort, Silence } from './types.js';
 
@@ -294,6 +295,9 @@ export async function produceSource(sourceId: string, o?: { limit?: number; deps
 export async function requalifyClip(clipId: string, deps?: Partial<ProduceDeps>): Promise<Clip> {
   const d: ProduceDeps = { ...defaultProduceDeps, ...deps };
   const clip = loadClip(clipId);
+  // Re-rendering resets the status, which would pull a published clip back into review (and from
+  // there towards a second upload) while overwriting the local copy of what is on YouTube.
+  if (isPublished(clip)) throw new Error(`requalify: clip ${clipId} is already published — refusing to re-render it`);
   if (clip.error) {
     delete clip.error;
     saveClip(clip);
@@ -318,6 +322,7 @@ export async function requalifyClip(clipId: string, deps?: Partial<ProduceDeps>)
  * as `produceSource`: on error, `clip.error` is set and saved, and the loop continues.
  */
 export async function requalifySource(sourceId: string, status: ClipStatus, deps?: Partial<ProduceDeps>): Promise<Clip[]> {
+  if (status === 'published') throw new Error('requalify: refusing to re-render published clips');
   const targets = listClips((c) => c.sourceId === sourceId && c.status === status);
   const results: Clip[] = [];
   for (const c of targets) {
