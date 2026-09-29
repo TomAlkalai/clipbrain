@@ -79,6 +79,22 @@ function asString(v: FlagValue | undefined): string | undefined {
   return typeof last === 'string' ? last : undefined;
 }
 
+/**
+ * A boolean switch: bare `--name` or `--name=true` is true, absent or `--name=false` is false
+ * (last one wins if repeated). Any other value throws instead of being read as true — with
+ * `Boolean(flag)`, `--live=false` used to mean a LIVE upload, and `--force src_x` silently
+ * swallowed the positional argument as the flag's value.
+ */
+export function asBool(v: FlagValue | undefined, name: string): boolean {
+  const last = Array.isArray(v) ? v[v.length - 1] : v;
+  if (last === undefined || last === false) return false;
+  if (last === true) return true;
+  const lower = last.trim().toLowerCase();
+  if (lower === 'true') return true;
+  if (lower === 'false') return false;
+  throw new Error(`--${name} is a switch: pass it bare (--${name}) or as --${name}=true|false, not "${last}"`);
+}
+
 // Normalize a flag value to a string array, dropping bare boolean flags.
 function asStringArray(v: FlagValue | undefined): string[] {
   if (v === undefined) return [];
@@ -253,7 +269,7 @@ export const commands: Record<string, { help: string; run: (a: ParsedArgs) => Pr
         process.exitCode = 1;
         return;
       }
-      if (a.flags.distill) {
+      if (asBool(a.flags.distill, 'distill')) {
         setBackend(claudeBackend);
         const pb = await distill(slug);
         savePlaybook(pb);
@@ -300,7 +316,7 @@ export const commands: Record<string, { help: string; run: (a: ParsedArgs) => Pr
         process.exitCode = 1;
         return;
       }
-      const result = await scanVisual(sourceId, { force: Boolean(a.flags.force) });
+      const result = await scanVisual(sourceId, { force: asBool(a.flags.force, 'force') });
       log(`scan ${sourceId}: ${result.shots} shots, ${result.samples} face samples`);
     },
   },
@@ -313,7 +329,7 @@ export const commands: Record<string, { help: string; run: (a: ParsedArgs) => Pr
         process.exitCode = 1;
         return;
       }
-      await analyzeSource(sourceId, { force: Boolean(a.flags.force) });
+      await analyzeSource(sourceId, { force: asBool(a.flags.force, 'force') });
       log(`analyze ${sourceId}: done`);
     },
   },
@@ -349,7 +365,7 @@ export const commands: Record<string, { help: string; run: (a: ParsedArgs) => Pr
       setBackend(claudeBackend);
       const candidates = await selectSource(sourceId, {
         top,
-        force: Boolean(a.flags.force),
+        force: asBool(a.flags.force, 'force'),
         windowSec,
         overlapSec,
       });
@@ -364,7 +380,7 @@ export const commands: Record<string, { help: string; run: (a: ParsedArgs) => Pr
         );
       }
 
-      if (a.flags.text) {
+      if (asBool(a.flags.text, 'text')) {
         const sentences = readJson<Sentence[]>(path.join(paths.source(sourceId), 'sentences.json'));
         for (const c of shortlisted) {
           const { opening, closing } = openingClosing(sentences, c);
@@ -793,7 +809,7 @@ export const commands: Record<string, { help: string; run: (a: ParsedArgs) => Pr
   publish: {
     help: 'publish [--live] [--clip <id>] — upload approved, QC-passed clips to YouTube (dry-run unless --live).',
     async run(a) {
-      const live = Boolean(a.flags.live);
+      const live = asBool(a.flags.live, 'live');
       const clipId = asString(a.flags.clip);
       await publish({ live, clipId });
     },
