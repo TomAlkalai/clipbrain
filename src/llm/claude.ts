@@ -39,7 +39,9 @@ export function extractShimScript(shimContents: string, shimDir: string): string
   const matches = [...shimContents.matchAll(/"([^"]+\.m?js)"/gi)].map((m) => m[1]);
   if (matches.length === 0) return null;
   const raw = matches[matches.length - 1].replace(/%dp0%/gi, shimDir);
-  return path.resolve(raw);
+  // Always a Windows path (shims only exist there): path.win32 is what path.resolve is on
+  // Windows, and keeps this pure function (and its test) correct on any OS.
+  return path.win32.resolve(raw);
 }
 
 type Resolved = { kind: 'exe'; cmd: string } | { kind: 'script'; script: string };
