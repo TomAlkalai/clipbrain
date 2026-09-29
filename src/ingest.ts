@@ -17,21 +17,39 @@ function findExistingSource(predicate: (s: Source) => boolean): Source | null {
   return null;
 }
 
+/**
+ * Pure: ffprobe JSON → the DISPLAYED frame size and duration. ffprobe reports a stream's coded
+ * size, but ffmpeg auto-rotates on every transcode (proxy, hi-res), so a phone video stored
+ * landscape with a 90°/270° display rotation must be recorded portrait — otherwise srcAspect
+ * disagrees with the frames every later stage sees. An audio-only file has nothing to crop or
+ * render, so it's rejected here with a clear error instead of failing later in ffmpeg.
+ */
+export function parseProbe(j: any, label = 'input'): { width: number; height: number; durationSec: number } {
+  const streams: any[] = j?.streams ?? [];
+  const v = streams.find((s) => Number(s?.width) > 0 && Number(s?.height) > 0);
+  if (!v) throw new Error(`no video stream in ${label} — a clip source needs video`);
+  const rotation = Number(v.side_data_list?.find((d: any) => d?.rotation !== undefined)?.rotation ?? v.tags?.rotate ?? 0);
+  const quarterTurn = Math.abs(Math.round(rotation)) % 180 === 90;
+  const width = Number(v.width);
+  const height = Number(v.height);
+  return {
+    width: quarterTurn ? height : width,
+    height: quarterTurn ? width : height,
+    durationSec: Number(j?.format?.duration ?? 0) || 0,
+  };
+}
+
 async function probeLocalFile(filePath: string): Promise<{ width: number; height: number; durationSec: number }> {
   const r = await runOk(ffprobe(), [
     '-v',
     'error',
     '-show_entries',
-    'stream=width,height:format=duration',
+    'stream=width,height:stream_side_data=rotation:stream_tags=rotate:format=duration',
     '-of',
     'json',
     filePath,
   ]);
-  const j = JSON.parse(r.stdout);
-  const streams: any[] = j.streams ?? [];
-  const videoStream = streams.find((s) => s.width && s.height) ?? {};
-  const durationSec = Number(j.format?.duration ?? 0);
-  return { width: videoStream.width ?? 0, height: videoStream.height ?? 0, durationSec };
+  return parseProbe(JSON.parse(r.stdout), path.basename(filePath));
 }
 
 export async function ingest(input: string, creator: string): Promise<Source> {
