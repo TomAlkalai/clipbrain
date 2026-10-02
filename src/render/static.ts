@@ -114,9 +114,13 @@ export function startStaticServer(root: string): Promise<{ url: string; close: (
       const addr = server.address() as AddressInfo;
       resolve({
         url: `http://127.0.0.1:${addr.port}`,
+        // close() alone waits for every open connection to end; a stalled client (e.g. a hung
+        // Chrome mid-way through a hires.mp4 range request) would keep it waiting forever. End
+        // them all: by the time this is called, nothing still needs the files.
         close: () =>
           new Promise((res, rej) => {
             server.close((err) => (err ? rej(err) : res()));
+            server.closeAllConnections();
           }),
       });
     });

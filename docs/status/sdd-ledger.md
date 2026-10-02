@@ -155,3 +155,10 @@ Render robustness: review ✅ spec; Important: fs.renameSync over possibly-locke
   - Ruling: `--max-usd` is cumulative over all of stage 1, counting already-built pools — a run resumed after a usage limit must not get a fresh budget — cost if wrong: none.
   - Ruling: pilot default cap $15 (counted toward the $60) — cost if wrong: a pilot that needs a higher cap stops early and can be resumed.
 
+## Render watchdog (2026-10-02, branch claude/render-watchdog — HANDOFF open item #2)
+- **Root cause of the 5-day hang** (`clip_4v1cw97c`): selectComposition/renderMedia had no timeout or cancel, so a lost Chrome connection waited forever. Also, `startStaticServer().close()` waited on open connections; a stalled client hung it (reproduced in a test).
+- Ruling: `renderClip` opens its own Chrome (openBrowser + puppeteerInstance) so a timeout can close exactly that browser — cost if wrong: none (Remotion's documented reuse pattern; openBrowser still downloads Chrome when missing).
+- Ruling: defaults are stall 5 min (no progress) and hard 60 min (total). Normal renders report progress every frame, and the slowest measured render was 937 s for a 144 s clip. Both are configurable via CB_RENDER_STALL_MIN / CB_RENDER_TIMEOUT_MIN — cost if wrong: a pathological machine needs a higher setting.
+- Ruling: no new clip status. A timed-out clip keeps its status (`planned` in produce) with `clip.error` set, so a later produce retries it, matching the existing errored-clip resume ruling — cost if wrong: each produce retries a deterministically-hanging clip, bounded by the stall timeout.
+- Ruling: bundling, the local-file hi-res re-encode and QC's ffmpeg measurements stay unbounded (out of scope; no observed hangs).
+
