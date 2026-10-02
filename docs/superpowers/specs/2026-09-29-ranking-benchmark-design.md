@@ -2,6 +2,8 @@
 
 **Status: approved 2026-10-02** with the recommended options (§13). Addresses HANDOFF open item #5 (ranking precision).
 
+Implemented in the follow-up PR: the metrics (§4–§5), folds and leakage guard (§6), `cb bench dataset` (§3), the `buildPool` extraction (§7), and stages 1–3 with `cb bench pilot` (§7, §9, §10).
+
 ## 1. Problem
 
 Selection finds the right moments but doesn't rank them well. On the Ray Dalio episode:
@@ -83,7 +85,7 @@ For each episode:
 - metrics are averaged over episodes, with 95 % confidence intervals from a bootstrap over episodes (10,000 resamples, seeded);
 - variant comparisons use a **paired** bootstrap of per-episode differences, since every variant ranks the same pools;
 - two reference lines are always reported:
-  - a random-order baseline (the analytic expectation over permutations of `P`);
+  - a random-order baseline (the expected score over random orderings of `P`, estimated with a seeded simulation);
   - an oracle that puts every relevant candidate first (equal to 1.0 for nDCG | pool; shown for R@6 and P@6).
 
 **Noise floor.** The claude CLI exposes no temperature or seed. The production ranker (V0) is therefore re-run 3× with the cache off. The spread of its paired differences against itself is the noise floor, and a variant has to clear it.

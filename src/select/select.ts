@@ -1,7 +1,7 @@
 import path from 'node:path';
 import fs from 'node:fs';
 import { paths, loadSource, loadCreator, readJson, readJsonOr, writeJson } from '../store.js';
-import { loadPlaybook, playbookPromptBlock } from '../playbook/playbook.js';
+import { loadPlaybook, playbookPromptBlock, type Playbook } from '../playbook/playbook.js';
 import { log, step } from '../log.js';
 import type { Sentence, Word, Candidate, Shot, FaceSample, ShortFeatures } from '../types.js';
 import { windows, snapBounds, composite, dedupe, mergeFragmentedSentences, candidateId } from './snap.js';
@@ -42,29 +42,33 @@ export function openingClosing(sentences: Sentence[], c: Candidate, n = 2): { op
   return { opening, closing };
 }
 
-export async function selectSource(sourceId: string, o?: SelectOpts): Promise<Candidate[]> {
-  const top = o?.top ?? 6;
-  const outPath = candidatesPath(sourceId);
+export type PoolInput = {
+  sourceId: string;
+  title: string;
+  creatorName: string;
+  pb: Playbook;
+  sentences: Sentence[];
+  words: Word[];
+  windowSec?: number;
+  overlapSec?: number;
+};
 
-  if (!o?.force) {
-    const existing = readJsonOr<Candidate[] | null>(outPath, null);
-    if (existing) {
-      log(`selectSource(${sourceId}): candidates.json already exists, skipping`);
-      return existing;
-    }
-  }
-
-  const dir = paths.source(sourceId);
-  const source = loadSource(sourceId);
-  const creator = loadCreator(source.creator);
-  const sentences = readJson<Sentence[]>(path.join(dir, 'sentences.json'));
-  const words = readJson<Word[]>(path.join(dir, 'words.json'));
-  const pb = loadPlaybook(source.creator);
+/**
+ * The transcript-only half of selection: per-window proposals -> range validation -> fragment
+ * merge -> snapping -> duration filter -> dedupe -> boundary check/repair on the top pool ->
+ * re-dedupe. Returns every surviving candidate (`all`, by composite descending) and the
+ * top-`TOP_POOL` slice that goes on to visual fitness and the final ranking (`pool`).
+ *
+ * Shared by `selectSource` (production) and the offline ranking benchmark, which calls it with an
+ * out-of-fold playbook and no video — so the benchmark measures this exact code, not a copy.
+ */
+export async function buildPool(i: PoolInput): Promise<{ all: Candidate[]; pool: Candidate[] }> {
+  const { sourceId, sentences, words, pb } = i;
   const pbBlock = playbookPromptBlock(pb);
   const { min: minSec, max: maxSec } = pb.idealDurationSec;
 
-  const ws = windows(sentences, o?.windowSec, o?.overlapSec);
-  const propCtx = { creatorName: creator.name, title: source.title, pbBlock, minSec, maxSec };
+  const ws = windows(sentences, i.windowSec, i.overlapSec);
+  const propCtx = { creatorName: i.creatorName, title: i.title, pbBlock, minSec, maxSec };
 
   const done = step(`selectSource ${sourceId}: proposing over ${ws.length} window(s)`);
   const rawPerWindow = await Promise.all(ws.map((w) => proposeWindow(propCtx, sentences, w)));
@@ -124,7 +128,7 @@ export async function selectSource(sourceId: string, o?: SelectOpts): Promise<Ca
   // lower instead of silently shipping.
   const boundsForCheck = { minSec, maxSec, weights: pb.weights };
   const checks = await Promise.all(pool.map((c) => checkBoundaries(c, sentences, { minSec, maxSec })));
-  const checkedPool = pool.map((c, i) => applyBoundaryCheck(c, checks[i], sentences, words, boundsForCheck));
+  const checkedPool = pool.map((c, idx) => applyBoundaryCheck(c, checks[idx], sentences, words, boundsForCheck));
   const repairedCount = checkedPool.filter((c) => c.boundary?.repaired).length;
   const penalizedCount = checkedPool.filter((c) => c.boundary && !c.boundary.repaired && (!c.boundary.openingStandalone || !c.boundary.endingComplete)).length;
   log(`selectSource ${sourceId}: boundary check repaired ${repairedCount}/${checkedPool.length}, penalized ${penalizedCount}/${checkedPool.length}`);
@@ -135,8 +139,40 @@ export async function selectSource(sourceId: string, o?: SelectOpts): Promise<Ca
   // checked pool together with the untouched rest: identical ranges have IoU 1, so dedupe keeps
   // only the higher-composite one. Re-slice into a (possibly smaller) top-TOP_POOL pool for
   // finalRank and everything else as "rest", same convention as the first pool/rest split above.
-  const dedupedAfterCheck = dedupe([...checkedPool, ...rest]);
-  const finalPool = dedupedAfterCheck.slice(0, TOP_POOL);
+  const all = dedupe([...checkedPool, ...rest]);
+  return { all, pool: all.slice(0, TOP_POOL) };
+}
+
+export async function selectSource(sourceId: string, o?: SelectOpts): Promise<Candidate[]> {
+  const top = o?.top ?? 6;
+  const outPath = candidatesPath(sourceId);
+
+  if (!o?.force) {
+    const existing = readJsonOr<Candidate[] | null>(outPath, null);
+    if (existing) {
+      log(`selectSource(${sourceId}): candidates.json already exists, skipping`);
+      return existing;
+    }
+  }
+
+  const dir = paths.source(sourceId);
+  const source = loadSource(sourceId);
+  const creator = loadCreator(source.creator);
+  const sentences = readJson<Sentence[]>(path.join(dir, 'sentences.json'));
+  const words = readJson<Word[]>(path.join(dir, 'words.json'));
+  const pb = loadPlaybook(source.creator);
+  const pbBlock = playbookPromptBlock(pb);
+
+  const { all: dedupedAfterCheck, pool: finalPool } = await buildPool({
+    sourceId,
+    title: source.title,
+    creatorName: creator.name,
+    pb,
+    sentences,
+    words,
+    windowSec: o?.windowSec,
+    overlapSec: o?.overlapSec,
+  });
 
   // Visual fitness: a clip can be strong on paper (transcript-only scores) and bad on screen —
   // no visible subject, nothing to crop tight on, jittery cuts, or a slide/ad burned into the
