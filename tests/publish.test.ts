@@ -176,3 +176,17 @@ it('a daily cap of 0 makes eligibleForPublish skip every candidate as cap-reache
   expect(eligible).toEqual([]);
   expect(skipped[0].reason).toMatch(/cap/i);
 });
+
+// Review finding: eligibility used to look only at `status`. A published clip that was later
+// re-rendered (hook switch, requalify) went back to ready -> approved and would be uploaded again.
+it('eligibleForPublish never re-uploads a clip that already has a live publish record, whatever its status', () => {
+  const now = new Date('2026-09-26T12:00:00.000Z');
+  const live = { videoId: 'v9', privacy: 'private', at: '2026-09-20T00:00:00.000Z', dryRun: false };
+  const clips = [
+    clip({ id: 'reapproved', status: 'approved', qc: { ok: true, checks: [], fixesApplied: [], at: '' }, publish: live }),
+    clip({ id: 'dry', status: 'approved', qc: { ok: true, checks: [], fixesApplied: [], at: '' }, publish: { ...live, dryRun: true } }),
+  ];
+  const { eligible, skipped } = eligibleForPublish(clips, now, 10);
+  expect(eligible.map((c) => c.id)).toEqual(['dry']);
+  expect(skipped).toEqual([{ id: 'reapproved', reason: 'already published as video v9' }]);
+});

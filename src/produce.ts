@@ -9,9 +9,10 @@ import { loadPlaybook } from './playbook/playbook.js';
 import { ingest } from './ingest.js';
 import { analyzeSource } from './analyze/analyze.js';
 import { selectSource } from './select/select.js';
-import { listChannel } from './yt/ytdlp.js';
+import { listChannel, canonicalWatchUrl } from './yt/ytdlp.js';
 import { mmss } from './select/propose.js';
 import { ledgerSummary } from './llm/llm.js';
+import { isPublished } from './publish/state.js';
 import { log, step } from './log.js';
 import type { Clip, ClipStatus, Word, Shot, FaceSample, Source, Creator, Candidate, Sentence, RefShort, Silence } from './types.js';
 
@@ -25,7 +26,11 @@ import type { Clip, ClipStatus, Word, Shot, FaceSample, Source, Creator, Candida
  * Pure.
  */
 export function attribution(source: Source, creator: Creator): string {
-  return `\n\nFrom "${source.title}" — ${creator.name}\nFull episode: ${source.url ?? ''}`;
+  // Canonical for YouTube sources, so a URL pasted from a playlist or share link (list=, t=, si=
+  // tracking) never ends up in a public description — including sources ingested before
+  // ingest() started storing the canonical form.
+  const url = source.kind === 'youtube' && source.videoId ? canonicalWatchUrl(source.videoId) : (source.url ?? '');
+  return `\n\nFrom "${source.title}" — ${creator.name}\nFull episode: ${url}`;
 }
 
 /**
@@ -294,6 +299,9 @@ export async function produceSource(sourceId: string, o?: { limit?: number; deps
 export async function requalifyClip(clipId: string, deps?: Partial<ProduceDeps>): Promise<Clip> {
   const d: ProduceDeps = { ...defaultProduceDeps, ...deps };
   const clip = loadClip(clipId);
+  // Re-rendering resets the status, which would pull a published clip back into review (and from
+  // there towards a second upload) while overwriting the local copy of what is on YouTube.
+  if (isPublished(clip)) throw new Error(`requalify: clip ${clipId} is already published — refusing to re-render it`);
   if (clip.error) {
     delete clip.error;
     saveClip(clip);
@@ -318,6 +326,7 @@ export async function requalifyClip(clipId: string, deps?: Partial<ProduceDeps>)
  * as `produceSource`: on error, `clip.error` is set and saved, and the loop continues.
  */
 export async function requalifySource(sourceId: string, status: ClipStatus, deps?: Partial<ProduceDeps>): Promise<Clip[]> {
+  if (status === 'published') throw new Error('requalify: refusing to re-render published clips');
   const targets = listClips((c) => c.sourceId === sourceId && c.status === status);
   const results: Clip[] = [];
   for (const c of targets) {
@@ -417,5 +426,36 @@ export async function scout(slug: string, o?: { latest?: number; minDurationSec?
   const list = await listChannel(creator.channelUrl, 'videos', latest * 3);
   const existing = existingVideoIdsForCreator(slug);
   const picked = pickNewEpisodes(list, existing, latest, minDurationSec);
-  return picked.map((e) => `https://www.youtube.com/watch?v=${e.id}`);
+  return picked.map((e) => canonicalWatchUrl(e.id));
+}
+
+export type RunLatestDeps = { scout: typeof scout; runPipeline: typeof runPipeline };
+export type RunLatestResult = { scouted: number; succeeded: string[]; failed: { url: string; error: string }[] };
+
+/**
+ * `run --creator <slug> --latest N`: scouts new episodes and runs the full pipeline on each,
+ * sequentially. This is the unattended path, so one episode failing (a transient network error
+ * during ingest, a whisper crash) is logged and the rest still run — the caller reports the
+ * failures and exits non-zero. An episode that failed during ingest leaves no source behind, so
+ * the next `run --latest` scouts it again; one that failed later already has a source (which
+ * scout skips), and `run <url>` resumes it — every stage picks up from what's on disk.
+ */
+export async function runLatest(
+  slug: string,
+  o: { latest: number; top: number },
+  deps: RunLatestDeps = { scout, runPipeline },
+): Promise<RunLatestResult> {
+  const urls = await deps.scout(slug, { latest: o.latest });
+  const result: RunLatestResult = { scouted: urls.length, succeeded: [], failed: [] };
+  for (const url of urls) {
+    try {
+      await deps.runPipeline(url, slug, { top: o.top });
+      result.succeeded.push(url);
+    } catch (err) {
+      const error = err instanceof Error ? err.message : String(err);
+      log(`run ${slug}: episode ${url} failed, continuing with the next one: ${error}`);
+      result.failed.push({ url, error });
+    }
+  }
+  return result;
 }

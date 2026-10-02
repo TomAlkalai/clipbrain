@@ -52,9 +52,7 @@ const NPM_CMD_SHIM = [
 ].join('\n');
 
 it('extractShimScript resolves the wrapped entry point from an npm cmd-shim', () => {
-  expect(extractShimScript(NPM_CMD_SHIM, 'C:\\npm\\')).toBe(
-    path.resolve('C:\\npm\\node_modules\\@anthropic-ai\\claude-code\\cli.js'),
-  );
+  expect(extractShimScript(NPM_CMD_SHIM, 'C:\\npm\\')).toBe('C:\\npm\\node_modules\\@anthropic-ai\\claude-code\\cli.js');
 });
 it('extractShimScript returns null when no .js path is found', () => {
   expect(extractShimScript('@echo off\r\necho nothing to see here\r\n', 'C:\\npm\\')).toBeNull();

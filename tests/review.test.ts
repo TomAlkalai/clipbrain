@@ -365,3 +365,14 @@ it('GET /api/jobs returns an array (initially may be non-empty from earlier test
   const jobs = await r.json();
   expect(Array.isArray(jobs)).toBe(true);
 });
+
+it('POST /api/clips/:id/hook refuses a published clip (a re-render would pull it back into review)', async () => {
+  const live = { videoId: 'v1', privacy: 'private', at: new Date().toISOString(), dryRun: false };
+  saveClip(makeClip({ id: 'clip_pub1', status: 'published', publish: live }));
+  let ran = 0;
+  setJobRunner(async () => { ran++; });
+  const r = await postJson('/api/clips/clip_pub1/hook', { index: 1 });
+  expect(r.status).toBe(409);
+  expect(loadClip('clip_pub1').hookIndex).toBe(0);
+  expect(ran).toBe(0);
+});
