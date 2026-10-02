@@ -134,3 +134,24 @@ Improvement (dead-air): fix round 2/5 ADDRESSED (commit 056ad95; isolated word-b
 Improvement (dead-air): complete (commits be9b0a5..056ad95, review clean after 2 fix rounds)
 Render robustness: live requalify clip_g5babhgx — no crash (6 renders, ~29 min), dead_air passes; final qc_failed on content/framing/ending/vision (legit QC judgement).
 Render robustness: review ✅ spec; Important: fs.renameSync over possibly-locked hires.mp4 on Windows discards a good download (no retry). Minor: orphan hires.tmp-* on hard kill; process.exit right after log may truncate redirected output; EPERM guard also on unhandledRejection (unneeded surface). Fix round deferred until the production chain finishes (each chain step loads current source).
+
+## Cloud session 2026-09-29 (code + unit tests only; no pipeline tools in the container)
+- Render robustness (HANDOFF #1) → PR #3.
+  - Ruling: retry the hires rename on EBUSY/EPERM/EACCES (EACCES added, matching graceful-fs), with 100 ms → 3.2 s backoff (~6.3 s) — cost if wrong: a slightly longer wait before a real lock error.
+  - Ruling: sweep the `hires.tmp-` *prefix* (it catches yt-dlp's .part/.fNNN intermediates), but only files idle > 30 min (2× the 15-min section timeout) — cost if wrong: an orphan lingers until the next fetch after 30 min.
+  - Ruling: crash guards moved to `src/tools/crash-guards.ts` so they're testable without importing the CLI entry point.
+- Whole-branch review (HANDOFF #4) → PR #4. Important findings fixed:
+  - `--live=false` performed a live upload (strict `asBool`);
+  - a published clip could be re-rendered and uploaded again (`isPublished` guards);
+  - playlist URLs downloaded whole playlists and leaked `list=`/`si=` into descriptions (canonical URL + `--no-playlist`);
+  - `run --latest` aborted on the first failed episode.
+  - The `extractShimScript` test made OS-independent. Remaining minors are listed in the PR.
+  - Ruling: minors not fixed in #4 — the user asked for Important only; five were then fixed in PR #6.
+- Review minors → PR #6: signal-kill = failure, `finalRank` id filtering, transcribe write order, review-API Host/Origin check (verified in headless Chromium), local-file rotation/audio-only (verified with real ffmpeg 6.1).
+- Ranking benchmark (HANDOFF #5) → design PR #5 (awaiting user decisions, §13); draft PR #7 with the decision-independent, LLM-free foundations.
+  - Ruling: build only those foundations before approval — the user asked for maximum progress within the session's credit budget — cost if wrong: the draft is discarded.
+- 2026-10-02: the user approved the benchmark design with all recommended options (fold re-distillation, graded relevance, boundary check kept, $60 stage-1 cap with the pilot first, variants V0/B-comp/B-rand/V1/V2/W-cv). The cost model was clarified: the $ figures are plan usage via the claude CLI, not a bill. PR #7 now implements stages 1–3 and `cb bench pilot`.
+  - Ruling: the leak guard checks only the Short-derived prompt parts (playbook block, audience titles); the transcript always contains every moment's words — cost if wrong: none (a whole-prompt check would fire on every episode).
+  - Ruling: `--max-usd` is cumulative over all of stage 1, counting already-built pools — a run resumed after a usage limit must not get a fresh budget — cost if wrong: none.
+  - Ruling: pilot default cap $15 (counted toward the $60) — cost if wrong: a pilot that needs a higher cap stops early and can be resumed.
+
