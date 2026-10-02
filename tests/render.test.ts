@@ -280,3 +280,22 @@ it('fetchAndReplaceHires: sweeps stale temp files left by an earlier hard-killed
   expect(fs.readFileSync(hiresPath, 'utf8')).toBe('FRESH');
   expect(tmpLeftovers(dir)).toEqual([]);
 });
+
+// HANDOFF open item #2: after a hung render, Chrome can still hold a half-finished request for
+// hires.mp4. http.Server.close() waits for every open connection to end, so the old close() could
+// itself hang forever in renderClip's finally. close() must end open connections and return.
+import net from 'node:net';
+it('startStaticServer: close() returns even while a client stalls mid-download', async () => {
+  const d = fs.mkdtempSync(path.join(os.tmpdir(), 'cbs-stall-'));
+  fs.writeFileSync(path.join(d, 'big.mp4'), Buffer.alloc(32 * 1024 * 1024, 1)); // far more than socket buffers hold
+  const s = await startStaticServer(d);
+  const { port } = new URL(s.url);
+  const sock = net.connect(Number(port), '127.0.0.1');
+  await new Promise<void>((r) => sock.once('connect', () => r()));
+  sock.write(`GET /big.mp4 HTTP/1.1\r\nHost: 127.0.0.1:${port}\r\n\r\n`);
+  sock.pause(); // never read: the response can't finish
+  await new Promise((r) => setTimeout(r, 100));
+  const closed = await Promise.race([s.close().then(() => 'closed'), new Promise((r) => setTimeout(() => r('hung'), 3000))]);
+  expect(closed).toBe('closed');
+  sock.destroy();
+});
