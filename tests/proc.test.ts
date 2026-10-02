@@ -17,9 +17,10 @@ it('passes stdin', async () => {
 // teardown emits an 'error' event (code EPERM, syscall 'kill') on a Windows ChildProcess with no
 // 'error' listener attached — Node re-emits an unlistened 'error' event as an uncaughtException,
 // which crashes the whole process before the per-clip try/catch in produce/requalify ever runs,
-// abandoning every remaining clip. src/cli.ts's main() registers global uncaughtException/
-// unhandledRejection handlers that swallow ONLY this exact error shape (logging a one-line
-// warning) and let per-clip error handling keep working; everything else still exits non-zero.
+// abandoning every remaining clip. src/cli.ts's main() installs crash guards
+// (src/tools/crash-guards.ts) whose uncaughtException handler swallows ONLY this exact error
+// shape (logging a one-line warning) so per-clip error handling keeps working; everything else,
+// including any unhandled rejection, still exits non-zero (see tests/crash-guards.test.ts).
 it('isIgnorableKillEperm: true for the exact EPERM/kill shape emitted by @remotion/renderer teardown on Windows', () => {
   expect(isIgnorableKillEperm(Object.assign(new Error('kill EPERM'), { code: 'EPERM', syscall: 'kill' }))).toBe(true);
 });

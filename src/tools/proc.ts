@@ -81,8 +81,9 @@ export async function runOk(cmd: string, args: string[], opts: RunOpts = {}): Pr
  * cleanup. Node re-emits an unlistened 'error' event as an uncaughtException, which (Bug 3) used
  * to crash the whole CLI process even when the render itself had already succeeded, or had
  * already failed for a separate, already-handled reason — abandoning every remaining clip in a
- * batch. src/cli.ts's global uncaughtException/unhandledRejection handlers use this predicate to
- * swallow ONLY this exact shape; anything else must still crash the process. Pure.
+ * batch. The uncaughtException guard in src/tools/crash-guards.ts uses this predicate to swallow
+ * ONLY this exact shape; anything else (and every unhandled rejection) must still crash the
+ * process. Pure.
  */
 export function isIgnorableKillEperm(err: unknown): boolean {
   if (!err || typeof err !== 'object') return false;
