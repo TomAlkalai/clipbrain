@@ -1,14 +1,8 @@
 # Ranking Benchmark — Design Spec (2026-09-29)
 
-**Status: proposed, awaiting approval.** Addresses HANDOFF open item #5 (ranking precision).
+**Status: approved 2026-10-02** with the recommended options (§13). Addresses HANDOFF open item #5 (ranking precision).
 
-The parts that don't depend on the §13 decisions and spend no LLM credits are built in a draft follow-up PR:
-- the pure metrics (§4–§5);
-- folds and the leakage guard (§6);
-- the offline `cb bench dataset` command (§3);
-- the `buildPool` extraction (§7).
-
-Stages 1–3 (pools, rank variants, report) are not built.
+Implemented in the follow-up PR: the metrics (§4–§5), folds and leakage guard (§6), `cb bench dataset` (§3), the `buildPool` extraction (§7), and stages 1–3 with `cb bench pilot` (§7, §9, §10).
 
 ## 1. Problem
 
@@ -108,7 +102,11 @@ Benchmarking an episode with a playbook that saw its own Shorts would let the ra
 
 - **Episode folds.** Episodes go into 3 folds, deterministically (`sha1(episodeId) mod 3`, so the split is stable across runs). For fold *f*, a **fold playbook** is distilled with the existing `distill()` from the features of Shorts whose episodes are *not* in *f*: about 2/3 of the 65 features, well above distill's minimum of 8. That costs 3 balanced-tier calls. Audience examples for fold *f* are likewise drawn only from Shorts outside *f*.
 - **Weights.** V0 uses the production `pb.weights`, which come from own-results learning, not official Shorts, so they don't leak.
-- **Runtime guard.** Before any proposal or rank call for episode *e*, the prompt is checked for any title or opening line (first 12 words) of *e*'s own official Shorts. A hit aborts the run with an error. The guard is covered by a unit test.
+- **Runtime guard.** Before any proposal or rank call for episode *e*, the Short-derived parts of the prompt are checked for any title or opening line (first 12 words) of *e*'s own official Shorts:
+  - the playbook block;
+  - the audience examples.
+
+  A hit aborts the run with an error. The guard is covered by a unit test. The episode transcript is deliberately not checked: it naturally contains every moment's words, and that's the input under test, not a leak.
 
 Consequence: the benchmark measures a playbook trained on about 2/3 of the data, slightly weaker than production's. That's the same for every variant, so comparisons hold; the absolute numbers are conservative.
 
@@ -216,10 +214,12 @@ Unit tests (pure, no LLM):
 - **Candidate pools are frozen** per playbook hash. Proposal-side changes (window size, proposer prompt) need a stage 1 rebuild, which is a separate and more expensive experiment.
 - **Overfitting to 29 episodes.** Mitigated by leave-one-episode-out cross-validation for weights, the paired decision rule and the young-episode check. Before any change ships, it should also be confirmed on the next newly-mined episodes.
 
-## 13. Decisions needed before building
+## 13. Decisions (approved 2026-10-02)
 
-1. **Leakage handling:** fold re-distillation (recommended, about 3 balanced-tier calls), or the cheaper "strip" option (production playbook with held-out Shorts' examples and audience titles removed; principles stay, a weaker guarantee)?
-2. **Relevance:** graded by perf (recommended; it rewards picking what performed well), or binary (any official pick counts equally)?
-3. **Boundary check in pools:** keep it (recommended, matches production; about 25 fast-tier calls per episode), or skip it to save cost?
-4. **Budget:** the `--max-usd` cap for stage 1 (suggested: $60, with the pilot's numbers reported before the full run).
-5. **First variants:** V0, B-comp, B-rand, V1, V2, W-cv? V3 (balanced-tier ranking) adds a cost comparison.
+1. **Leakage handling:** fold re-distillation (3 balanced-tier distill calls).
+2. **Relevance:** graded by perf.
+3. **Boundary check in pools:** kept, as in production.
+4. **Budget:** `--max-usd 60` for stage 1. A 3-episode pilot runs first, and its real cost and time are reported before the full run.
+5. **First variants:** V0, B-comp, B-rand, V1, V2 and W-cv. V3 (balanced-tier ranking) is available but not in the default set.
+
+**Cost model.** The `$` figures are the cost Claude Code reports per call. With the `claude` CLI logged in to a Claude subscription, they count against the plan's usage limits rather than being billed, so the cap limits plan usage. Stage 1 is resumable across usage-limit resets.
