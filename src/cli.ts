@@ -1,3 +1,4 @@
+import fs from 'node:fs';
 import path from 'node:path';
 import { doctor as runDoctor, setup as runSetup } from './tools/bins.js';
 import { isIgnorableKillEperm } from './tools/proc.js';
@@ -22,6 +23,10 @@ import { ensureHires, renderClip, truncateEdl } from './render/render.js';
 import { qcClip } from './qc/qc.js';
 import { produceSource, requalifyClip, requalifySource, runPipeline, scout } from './produce.js';
 import { evalSource } from './eval.js';
+import { buildDataset, datasetPath, MIN_PUNCTUATION_DENSITY, type BenchDataset } from './bench/dataset.js';
+import { buildPools } from './bench/pools.js';
+import { rankVariants, DEFAULT_VARIANTS, VARIANT_INFO, type VariantId } from './bench/variants.js';
+import { writeReport, reportPaths } from './bench/report.js';
 import { createReviewServer } from './review/server.js';
 import { authorize } from './publish/oauth.js';
 import { publish } from './publish/youtube.js';
@@ -89,6 +94,38 @@ function asStringArray(v: FlagValue | undefined): string[] {
 // Mirrors types.ts's ClipStatus union exactly — used to validate `--status` on `requalify`
 // (and `clips --status`, informally) against a real value instead of silently casting a typo.
 const CLIP_STATUSES: ClipStatus[] = ['planned', 'rendered', 'qc_failed', 'ready', 'approved', 'rejected', 'published'];
+
+function parseVariants(v: string | undefined): VariantId[] | null {
+  if (v === undefined) return DEFAULT_VARIANTS;
+  const ids = v.split(',').map((x) => x.trim()).filter(Boolean);
+  return ids.every((id) => id in VARIANT_INFO) ? (ids as VariantId[]) : null;
+}
+
+function printDataset(ds: BenchDataset): void {
+  console.log('episode'.padEnd(13), 'fold', 'young'.padEnd(6), 'moments', 'words'.padStart(7), 'punct'.padStart(6), 'seg'.padEnd(11), 'title');
+  for (const e of ds.episodes) {
+    const t = e.transcript;
+    console.log(
+      e.episodeId.padEnd(13),
+      String(e.fold).padEnd(4),
+      String(e.young ?? '?').padEnd(6),
+      String(e.moments.length).padEnd(7),
+      String(t?.words ?? '-').padStart(7),
+      (t ? `${(t.punctuationDensity * 100).toFixed(1)}%` : '-').padStart(6),
+      (t?.segmentation ?? 'NO SUBS').padEnd(11),
+      e.title.slice(0, 50),
+    );
+  }
+  const sm = ds.summary;
+  const pd = sm.medianPunctuationDensity;
+  console.log(
+    `\n${sm.episodes} episodes, ${sm.moments} official moments, folds ${sm.perFold.join('/')}, ${sm.young} young (<${ds.minAgeDays} d), ` +
+      `${sm.missingTranscripts} without cached subtitles, median punctuation ${pd === null ? '-' : `${(pd * 100).toFixed(1)}%`}`,
+  );
+  if (sm.missingTranscripts > 0) log(`warning: ${sm.missingTranscripts} episode(s) have no cached subtitles — re-run \`cb mine ${ds.slug}\` to fetch them`);
+  if (pd !== null && pd < MIN_PUNCTUATION_DENSITY) log('note: captions are mostly unpunctuated — the benchmark uses gap-based sentence splits (design §3)');
+  log(`wrote ${datasetPath(ds.slug)}`);
+}
 
 async function printDoctorReport(): Promise<boolean> {
   const rows = await runDoctor();
@@ -815,6 +852,68 @@ export const commands: Record<string, { help: string; run: (a: ParsedArgs) => Pr
       }
       const n = await collectStats();
       log(`stats: updated ${n} clip(s)`);
+    },
+  },
+  bench: {
+    help:
+      'bench dataset|pools|rank|report|pilot <slug> — offline ranking benchmark (design: docs/superpowers/specs/2026-09-29-ranking-benchmark-design.md). ' +
+      'pilot = 3 episodes end to end; pools [--pilot] [--episodes a,b] [--max-usd 60]; rank [--variants V0,B-comp,V1,V2,W-cv] [--repeat 1]; report.',
+    async run(a) {
+      const [sub, slug] = a._;
+      const usage = 'usage: cb bench <dataset|pools|rank|report|pilot> <slug> [options] — see `cb` help';
+      if (!slug || !['dataset', 'pools', 'rank', 'report', 'pilot'].includes(sub)) {
+        log(usage);
+        process.exitCode = 1;
+        return;
+      }
+      if (sub === 'dataset') {
+        const folds = Number(asString(a.flags.folds) ?? 3) || 3;
+        const minAgeDays = Number(asString(a.flags['min-age-days']) ?? 21);
+        printDataset(buildDataset(slug, { folds, minAgeDays: Number.isFinite(minAgeDays) ? minAgeDays : 21 }));
+        return;
+      }
+      if (sub === 'report') {
+        writeReport(slug);
+        console.log(fs.readFileSync(reportPaths(slug).md, 'utf8'));
+        log(`wrote ${reportPaths(slug).md}`);
+        return;
+      }
+      setBackend(claudeBackend);
+      const variants = parseVariants(asString(a.flags.variants));
+      if (!variants) {
+        log(`--variants must be a comma list of: ${Object.keys(VARIANT_INFO).join(', ')}`);
+        process.exitCode = 1;
+        return;
+      }
+      if (sub === 'pools' || sub === 'pilot') {
+        const pilot = sub === 'pilot' || a.flags.pilot === true || asString(a.flags.pilot) === 'true';
+        const maxUsd = Number(asString(a.flags['max-usd']) ?? (sub === 'pilot' ? 15 : 60));
+        const episodes = (asString(a.flags.episodes) ?? '').split(',').map((x) => x.trim()).filter(Boolean);
+        if (sub === 'pilot') printDataset(buildDataset(slug));
+        const r = await buildPools(slug, { pilot, episodes, maxUsd: Number.isFinite(maxUsd) ? maxUsd : 60 });
+        log(`pools: ${r.built.length} built, ${r.cached.length} cached, ${r.skipped.length} skipped — $${r.spentUsd.toFixed(2)} this run, $${r.totalUsd.toFixed(2)} on stage 1 in total`);
+        for (const s of r.skipped) log(`  skipped ${s.episodeId}: ${s.reason}`);
+        if (r.stoppedForBudget) log('  stopped at the --max-usd cap; re-run (optionally with a higher cap) to continue');
+        if (r.failed) {
+          log(`  stopped at ${r.failed.episodeId}: ${r.failed.error} — probably a usage limit; re-run later to resume`);
+          process.exitCode = 1;
+          return;
+        }
+        if (sub === 'pools') return;
+      }
+      const repeats = Number(asString(a.flags.repeat) ?? (sub === 'pilot' ? 1 : 0));
+      const rr = await rankVariants(slug, { variants, repeats: Number.isFinite(repeats) ? repeats : 0 });
+      log(`rank: ${rr.written} ranking(s) written, $${rr.costUsd.toFixed(2)} spent`);
+      if (rr.failed) {
+        log(`  stopped at ${rr.failed.key}/${rr.failed.episodeId}: ${rr.failed.error} — re-run later to resume`);
+        process.exitCode = 1;
+        return;
+      }
+      if (sub === 'pilot') {
+        writeReport(slug);
+        console.log(fs.readFileSync(reportPaths(slug).md, 'utf8'));
+        log(`wrote ${reportPaths(slug).md} — share this file to review the pilot`);
+      }
     },
   },
   learn: {

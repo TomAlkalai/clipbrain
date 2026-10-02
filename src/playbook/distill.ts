@@ -99,12 +99,19 @@ function clampDuration(x: number): number {
 
 export async function distill(slug: string): Promise<Playbook> {
   const featuresPath = path.join(paths.creator(slug), 'features.json');
-  const features = readJson<ShortFeatures[]>(featuresPath);
+  return distillFeatures(slug, readJson<ShortFeatures[]>(featuresPath), loadPlaybook(slug));
+}
+
+/**
+ * Distills a playbook from the given features (rather than the creator's whole features.json),
+ * keeping `old`'s weights and own results. The ranking benchmark uses it to build fold playbooks
+ * from out-of-fold Shorts only, so an episode is never scored with a playbook that saw its own.
+ */
+export async function distillFeatures(slug: string, features: ShortFeatures[], old: Playbook): Promise<Playbook> {
   if (features.length < MIN_ALIGNED) {
     throw new Error('not enough aligned shorts');
   }
 
-  const old = loadPlaybook(slug);
   const stats = computeStats(features);
   const examples = pickExamples(features);
 
