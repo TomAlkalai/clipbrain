@@ -54,11 +54,17 @@ export function run(cmd: string, args: string[], opts: RunOpts = {}): Promise<Ru
       reject(err);
     });
 
-    child.on('close', (code) => {
+    child.on('close', (code, signal) => {
       if (settled) return;
       settled = true;
       if (timer) clearTimeout(timer);
-      resolve({ code: code ?? 0, stdout, stderr });
+      // A child killed by a signal (crash, OOM killer) closes with code === null: that is a
+      // failure, never exit 0 — and the signal goes into stderr so runOk's error names it.
+      if (code === null) {
+        resolve({ code: 1, stdout, stderr: `${stderr}\n[killed by signal ${signal ?? 'unknown'}]` });
+        return;
+      }
+      resolve({ code, stdout, stderr });
     });
 
     child.stdin?.end(opts.input ?? '');

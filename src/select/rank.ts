@@ -85,5 +85,15 @@ export async function finalRank(
     prompt,
     schema: { ...RANK_SCHEMA, properties: { ranking: { ...RANK_SCHEMA.properties.ranking, maxItems: n } } },
   });
-  return (result.ranking ?? []).slice(0, n);
+  // Keep only ids that are really in the pool, each once: a typo'd/hallucinated or repeated id
+  // would otherwise use up a shortlist slot.
+  const known = new Set(cands.map((c) => c.id));
+  const seen = new Set<string>();
+  const ranking: { id: string; reason: string }[] = [];
+  for (const r of result.ranking ?? []) {
+    if (!known.has(r.id) || seen.has(r.id)) continue;
+    seen.add(r.id);
+    ranking.push(r);
+  }
+  return ranking.slice(0, n);
 }

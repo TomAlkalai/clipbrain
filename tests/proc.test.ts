@@ -39,3 +39,12 @@ it('isIgnorableKillEperm: false for non-error values (string, undefined, null, p
   expect(isIgnorableKillEperm(null)).toBe(false);
   expect(isIgnorableKillEperm({})).toBe(false);
 });
+
+// Review finding: a child killed by a signal closes with code === null; run() used to report that
+// as exit code 0, so runOk treated a crashed/OOM-killed ffmpeg or whisper run as a success.
+it('run reports a signal-killed child as a failure, and runOk throws', async () => {
+  const script = 'process.kill(process.pid, "SIGKILL")';
+  const r = await run(process.execPath, ['-e', script]);
+  expect(r.code).not.toBe(0);
+  await expect(runOk(process.execPath, ['-e', script])).rejects.toThrow(/exited with code/);
+});

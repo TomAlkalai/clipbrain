@@ -95,10 +95,11 @@ export async function transcribeSource(id: string): Promise<Word[]> {
   }
 
   const words = wordsFromCaptions(captions);
-  writeJson(wordsPath, words);
-
   const sentences = buildSentences(words);
+  // words.json is the "already transcribed" marker checked above, so it is written last: a crash
+  // between the two writes must not leave a words.json without its sentences.json.
   writeJson(path.join(dir, 'sentences.json'), sentences);
+  writeJson(wordsPath, words);
 
   log(`transcribed ${id}: ${words.length} words, ${sentences.length} sentences`);
   return words;
