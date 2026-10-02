@@ -137,6 +137,8 @@ Measured on this development machine (i5-10300H):
 
 Your own hardware will vary; treat these as ballpark, not guarantees.
 
+Renders have timeouts, so one stuck render can't stall a whole `produce` run. A render fails if Remotion reports no progress for `CB_RENDER_STALL_MIN` minutes (default 5), or if it runs longer than `CB_RENDER_TIMEOUT_MIN` minutes in total (default 60). When that happens, that render's Chrome is closed, the reason is saved in the clip's `error`, and the run continues with the next clip. A later `produce` retries the clip. Raise the limits in `.env` if your machine renders much slower than the numbers above.
+
 ## Data layout
 
 Everything lives under `data/` (gitignored):

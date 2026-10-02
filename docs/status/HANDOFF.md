@@ -49,11 +49,24 @@ Suggested order: #4 → #3 → #6 (they merge cleanly in any order), then #5 →
    - The `fs.renameSync` over `hires.mp4` needs a short retry/backoff for Windows file locks (EBUSY/EPERM). Right now a locked rename discards a good download.
    - Also: sweep stale `hires.tmp-*.mp4` files.
    - In `src/cli.ts` `installCrashGuards`: flush output before `process.exit`, and only attach the EPERM guard to `uncaughtException`.
-2. **Render can hang forever (Important, NEW 2026-10-02).** The local `produce src_51gj6f62` (resume) step hung for 5 days while rendering `clip_4v1cw97c`. Headless Chrome tabs stayed open and no progress was logged; it was killed manually.
-   - The clip already had a "Failed to fetch" error, which suggests Remotion lost its connection to the local static server (or the hi-res URL) and waited forever.
-   - Needed: a render watchdog in `renderClip`. Abort `renderMedia` via a cancel signal when there's no progress for N minutes (e.g. `timeoutInMilliseconds` + an AbortSignal), then fail the clip with `clip.error` so `produce` moves on.
-   - Also confirm the static server stays up for the whole render.
-3. **Production chain at handoff (local).** `clip_4v1cw97c` is still `planned` (see item 2); resume will retry it. The Dalio clips `clip_qlgb9gwj` (stale-hires bug, fixed in da1cc09; needs `requalify`) and ranks 3–5 (hook generation hit a usage limit) need `produce src_xrq3w2z7` / `requalify`.
+2. **Render can hang forever: fixed on branch `claude/render-watchdog` (2026-10-03). Still to do: verify on Windows.** The local `produce src_51gj6f62` (resume) step hung for 5 days while rendering `clip_4v1cw97c`, with headless Chrome left open.
+   - **Root cause:** `selectComposition`/`renderMedia` had no timeout or cancel signal, so a lost Chrome connection waited forever. Separately, the static server's `close()` waited for every open connection, so a stalled Chrome request could also hang the `finally` (reproduced in a test).
+   - **Fix:**
+     - `renderClip` opens its own Chrome and runs launch, composition and frame rendering under a watchdog (`src/render/watchdog.ts`).
+     - **Stall timeout:** no Remotion progress for `CB_RENDER_STALL_MIN` (default 5 min).
+     - **Hard cap:** `CB_RENDER_TIMEOUT_MIN` (default 60 min).
+     - **On timeout:** cancels `renderMedia`, closes that Chrome (also one that only finishes launching after the timeout), and throws a `RenderTimeoutError` with the last progress (stage and frame).
+     - **Teardown:** Chrome and the server are always torn down, with a bound; the static server force-closes its connections.
+     - **ffmpeg post-steps:** loudness, probe and poster each get a 10-min kill-on-timeout.
+   - **What callers do:** unchanged. `produce` keeps the clip `planned` with `clip.error` = the timeout reason and continues with the next clip; a later `produce` retries it. `requalify`, the QC fix loop and the review UI job record the error the same way.
+   - **Tests:** 17 new, 363/363 passing on Linux.
+   - **Not yet bounded** (lower risk, not part of this fix): webpack bundling, the local-file hi-res re-encode in `ensureHires`, and QC's ffmpeg measurements.
+   - **Verify on Windows:**
+     - `npx vitest run`
+     - `npx tsx src/cli.ts requalify clip_qlgb9gwj`: a normal render must finish and not time out.
+     - Optional forced timeout, in PowerShell: `$env:CB_RENDER_STALL_MIN="0.05"; npx tsx src/cli.ts requalify clip_qlgb9gwj; Remove-Item Env:CB_RENDER_STALL_MIN`. Expect "render timed out…", no leftover `chrome-headless-shell` processes, and the error recorded on the clip. Then re-run without the override.
+     - `npx tsx src/cli.ts produce src_51gj6f62` to resume `clip_4v1cw97c`.
+3. **Production chain at handoff (local).** `clip_4v1cw97c` is still `planned` (see item 2). Resume will retry it; with the watchdog it now either renders or fails cleanly within minutes. The Dalio clips `clip_qlgb9gwj` (stale-hires bug, fixed in da1cc09; needs `requalify`) and ranks 3–5 (hook generation hit a usage limit) need `produce src_xrq3w2z7` / `requalify`.
 4. **Local-file input path** (`run <file>`) is implemented but not yet exercised end to end. TomAlkalai/clipbrain#6 fixes rotated phone videos and audio-only files at ingest (checked with real ffmpeg); transcription → render on a local file is still unverified.
 5. **Final whole-branch code review**: done in TomAlkalai/clipbrain#4 (with follow-ups in #6); the remaining minors are listed in #4's description.
 6. **Ranking precision (highest-value product improvement; design in TomAlkalai/clipbrain#5, benchmark built in #7 — next step: run `bench pilot doac`).** Build an offline ranking benchmark over the 29 recent episodes that have aligned official Shorts: transcript-only (YouTube json3 subs, no video), cheap to run. Use it to tune the ranker/weights instead of anecdotes from one episode.
