@@ -49,7 +49,7 @@ Suggested order: #4 → #3 → #6 (they merge cleanly in any order), then #5 →
    - The `fs.renameSync` over `hires.mp4` needs a short retry/backoff for Windows file locks (EBUSY/EPERM). Right now a locked rename discards a good download.
    - Also: sweep stale `hires.tmp-*.mp4` files.
    - In `src/cli.ts` `installCrashGuards`: flush output before `process.exit`, and only attach the EPERM guard to `uncaughtException`.
-2. **Render can hang forever: fixed in TomAlkalai/clipbrain#10 (branch `claude/render-watchdog`, 2026-10-03). Still to do: verify on Windows.** The local `produce src_51gj6f62` (resume) step hung for 5 days while rendering `clip_4v1cw97c`, with headless Chrome left open.
+2. **Render can hang forever: fixed in TomAlkalai/clipbrain#10 (branch `claude/render-watchdog`, 2026-10-02). Still to do: verify on Windows.** The local `produce src_51gj6f62` (resume) step hung for 5 days while rendering `clip_4v1cw97c`, with headless Chrome left open.
    - **Root cause:** `selectComposition`/`renderMedia` had no timeout or cancel signal, so a lost Chrome connection waited forever. Separately, the static server's `close()` waited for every open connection, so a stalled Chrome request could also hang the `finally` (reproduced in a test).
    - **Fix:**
      - `renderClip` opens its own Chrome and runs launch, composition and frame rendering under a watchdog (`src/render/watchdog.ts`).
