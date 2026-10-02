@@ -23,8 +23,12 @@ QC has these parts:
 - **Ray Dalio episode (1.5 h), end-to-end:** transcription ran at 8.5× realtime. Rendering took ≈ 2.7–3.2× the clip length when not CPU-contended. Selection was evaluated against DOAC's 5 official Shorts from that episode: recall 40 % → 80 % after the window change, but precision was 0/5 (the ranker prefers geopolitics over the channel's personal-finance picks).
 - **LLM spend for the whole build + runs:** ≈ $10.8 (`npx tsx src/cli.ts ledger`).
 
-## Open PRs from the 2026-09-29 cloud session (review these first)
-These came from a cloud session with no ffmpeg pipeline, `bin/` tools, logged-in `claude` CLI or `data/`. Everything is covered by unit tests (plus a few real ffmpeg / headless-Chromium checks, noted per PR), but none of it has been run through the real pipeline on Windows yet.
+## PRs from the 2026-09-29 cloud session: all MERGED into `main` (2026-10-02)
+These came from a cloud session with no ffmpeg pipeline, `bin/` tools, logged-in `claude` CLI or `data/`.
+
+- **Merged:** #3–#8, plus #9. #9 carries #7's benchmark into `main`, because #7 was stacked on #5's branch.
+- **Verified on Windows** before merging: the combined result typechecks clean, and **346/346 tests pass**.
+- **Not yet verified:** none of it has been run through the real pipeline yet. Do the post-merge checks below.
 
 | PR | What | Status |
 |---|---|---|
@@ -41,15 +45,19 @@ Suggested order: #4 → #3 → #6 (they merge cleanly in any order), then #5 →
 - **the benchmark pilot:** `npx tsx src/cli.ts bench pilot doac`. It covers 3 episodes, its default cap is $15 of plan usage, and it writes `data/bench/doac/report/report.md`. Review that report (cost and time per episode, pool recall, label sanity) before the full run: `bench pools doac --max-usd 60` → `bench rank doac --repeat 1` → `bench report doac`.
 
 ## Open items (in priority order)
-1. **Render robustness follow-up (Important — fix in TomAlkalai/clipbrain#3).** `fetchAndReplaceHires` in `src/render/render.ts`:
+1. **Render robustness follow-up: fixed in TomAlkalai/clipbrain#3 (merged). Still to do: verify with one real `requalify` on Windows.** `fetchAndReplaceHires` in `src/render/render.ts`:
    - The `fs.renameSync` over `hires.mp4` needs a short retry/backoff for Windows file locks (EBUSY/EPERM). Right now a locked rename discards a good download.
    - Also: sweep stale `hires.tmp-*.mp4` files.
    - In `src/cli.ts` `installCrashGuards`: flush output before `process.exit`, and only attach the EPERM guard to `uncaughtException`.
-2. **Production chain was mid-run at handoff (local).** `clip_4v1cw97c` failed with "Failed to fetch" (network) and resume will retry it. The Dalio clips `clip_qlgb9gwj` (stale-hires bug, fixed in da1cc09; needs `requalify`) and ranks 3–5 (hook generation hit a usage limit) need `produce src_xrq3w2z7` / `requalify`.
-3. **Local-file input path** (`run <file>`) is implemented but not yet exercised end to end. TomAlkalai/clipbrain#6 fixes rotated phone videos and audio-only files at ingest (checked with real ffmpeg); transcription → render on a local file is still unverified.
-4. **Final whole-branch code review**: done in TomAlkalai/clipbrain#4 (with follow-ups in #6); the remaining minors are listed in #4's description.
-5. **Ranking precision (highest-value product improvement; design in TomAlkalai/clipbrain#5, benchmark built in #7 — next step: run `bench pilot doac`).** Build an offline ranking benchmark over the 29 recent episodes that have aligned official Shorts: transcript-only (YouTube json3 subs, no video), cheap to run. Use it to tune the ranker/weights instead of anecdotes from one episode.
-6. **Render speed.** Chrome frame rendering dominates. Consider an ffmpeg-native crop/concat path with a Remotion (or ASS) overlay for captions and hook only.
+2. **Render can hang forever (Important, NEW 2026-10-02).** The local `produce src_51gj6f62` (resume) step hung for 5 days while rendering `clip_4v1cw97c`. Headless Chrome tabs stayed open and no progress was logged; it was killed manually.
+   - The clip already had a "Failed to fetch" error, which suggests Remotion lost its connection to the local static server (or the hi-res URL) and waited forever.
+   - Needed: a render watchdog in `renderClip`. Abort `renderMedia` via a cancel signal when there's no progress for N minutes (e.g. `timeoutInMilliseconds` + an AbortSignal), then fail the clip with `clip.error` so `produce` moves on.
+   - Also confirm the static server stays up for the whole render.
+3. **Production chain at handoff (local).** `clip_4v1cw97c` is still `planned` (see item 2); resume will retry it. The Dalio clips `clip_qlgb9gwj` (stale-hires bug, fixed in da1cc09; needs `requalify`) and ranks 3–5 (hook generation hit a usage limit) need `produce src_xrq3w2z7` / `requalify`.
+4. **Local-file input path** (`run <file>`) is implemented but not yet exercised end to end. TomAlkalai/clipbrain#6 fixes rotated phone videos and audio-only files at ingest (checked with real ffmpeg); transcription → render on a local file is still unverified.
+5. **Final whole-branch code review**: done in TomAlkalai/clipbrain#4 (with follow-ups in #6); the remaining minors are listed in #4's description.
+6. **Ranking precision (highest-value product improvement; design in TomAlkalai/clipbrain#5, benchmark built in #7 — next step: run `bench pilot doac`).** Build an offline ranking benchmark over the 29 recent episodes that have aligned official Shorts: transcript-only (YouTube json3 subs, no video), cheap to run. Use it to tune the ranker/weights instead of anecdotes from one episode.
+7. **Render speed.** Chrome frame rendering dominates. Consider an ffmpeg-native crop/concat path with a Remotion (or ASS) overlay for captions and hook only.
 
 ## Environment notes for cloud sessions
 The pipeline needs these, none of which are in the repo:
