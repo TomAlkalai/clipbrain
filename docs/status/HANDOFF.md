@@ -31,14 +31,14 @@ These came from a cloud session with no ffmpeg pipeline, `bin/` tools, logged-in
 | TomAlkalai/clipbrain#3 | Open item #1: locked-rename retry and stale-temp sweep in `fetchAndReplaceHires`; crash guards flush output before exit, and the EPERM ignore applies to `uncaughtException` only | Ready for review |
 | TomAlkalai/clipbrain#4 | Open item #4: whole-branch review. It fixes `--live=false` → live upload, published clips being re-uploadable, playlist URLs downloading whole playlists, and `run --latest` aborting on the first failure; it also makes the suite green on Linux. It lists all remaining minors. | Ready for review |
 | TomAlkalai/clipbrain#6 | Five of #4's new minors: signal-killed child = failure, `finalRank` id filtering, transcribe write order, the review API refusing DNS rebinding and cross-site POSTs, and local-file rotation plus audio-only handling (touches open item #3) | Ready for review |
-| TomAlkalai/clipbrain#5 | Open item #5: ranking-benchmark **design**. §13 lists the decisions needed from the user. | Awaiting user approval |
-| TomAlkalai/clipbrain#7 | **Draft**, stacked on #5: benchmark foundations that don't depend on any decision and spend no LLM calls (metrics, folds + leakage guard, `cb bench dataset`, `buildPool` extraction) | Draft, pending #5 |
+| TomAlkalai/clipbrain#5 | Open item #5: ranking-benchmark **design**, approved 2026-10-02 with the recommended options (§13) | Ready (approved) |
+| TomAlkalai/clipbrain#7 | Stacked on #5: the full benchmark (metrics, folds + leak guard, dataset, `buildPool` extraction, stages 1–3, `cb bench pilot`) | Ready for review |
 
-Suggested order: #4 → #3 → #6 (they merge cleanly in any order), then #5 → #7 after the user answers §13. After merging, on the Windows machine:
+Suggested order: #4 → #3 → #6 (they merge cleanly in any order), then #5 → #7. With all of them merged together, `tsc` is clean and 346/346 tests pass (checked on Linux). After merging, on the Windows machine:
 - `npx vitest run`;
 - `requalify` one clip (#3 retry/sweep path);
 - `publish` without `--live` (#4 flag parsing);
-- `npx tsx src/cli.ts bench dataset doac`, which answers the benchmark pilot's first question (are the cached captions punctuated?) for free.
+- **the benchmark pilot:** `npx tsx src/cli.ts bench pilot doac`. It covers 3 episodes, its default cap is $15 of plan usage, and it writes `data/bench/doac/report/report.md`. Review that report (cost and time per episode, pool recall, label sanity) before the full run: `bench pools doac --max-usd 60` → `bench rank doac --repeat 1` → `bench report doac`.
 
 ## Open items (in priority order)
 1. **Render robustness follow-up (Important — fix in TomAlkalai/clipbrain#3).** `fetchAndReplaceHires` in `src/render/render.ts`:
@@ -48,7 +48,7 @@ Suggested order: #4 → #3 → #6 (they merge cleanly in any order), then #5 →
 2. **Production chain was mid-run at handoff (local).** `clip_4v1cw97c` failed with "Failed to fetch" (network) and resume will retry it. The Dalio clips `clip_qlgb9gwj` (stale-hires bug, fixed in da1cc09; needs `requalify`) and ranks 3–5 (hook generation hit a usage limit) need `produce src_xrq3w2z7` / `requalify`.
 3. **Local-file input path** (`run <file>`) is implemented but not yet exercised end to end. TomAlkalai/clipbrain#6 fixes rotated phone videos and audio-only files at ingest (checked with real ffmpeg); transcription → render on a local file is still unverified.
 4. **Final whole-branch code review**: done in TomAlkalai/clipbrain#4 (with follow-ups in #6); the remaining minors are listed in #4's description.
-5. **Ranking precision (highest-value product improvement; design in TomAlkalai/clipbrain#5, foundations in draft #7).** Build an offline ranking benchmark over the 29 recent episodes that have aligned official Shorts: transcript-only (YouTube json3 subs, no video), cheap to run. Use it to tune the ranker/weights instead of anecdotes from one episode.
+5. **Ranking precision (highest-value product improvement; design in TomAlkalai/clipbrain#5, benchmark built in #7 — next step: run `bench pilot doac`).** Build an offline ranking benchmark over the 29 recent episodes that have aligned official Shorts: transcript-only (YouTube json3 subs, no video), cheap to run. Use it to tune the ranker/weights instead of anecdotes from one episode.
 6. **Render speed.** Chrome frame rendering dominates. Consider an ffmpeg-native crop/concat path with a Remotion (or ASS) overlay for captions and hook only.
 
 ## Environment notes for cloud sessions

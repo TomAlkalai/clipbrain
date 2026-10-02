@@ -150,4 +150,8 @@ Render robustness: review ✅ spec; Important: fs.renameSync over possibly-locke
 - Review minors → PR #6: signal-kill = failure, `finalRank` id filtering, transcribe write order, review-API Host/Origin check (verified in headless Chromium), local-file rotation/audio-only (verified with real ffmpeg 6.1).
 - Ranking benchmark (HANDOFF #5) → design PR #5 (awaiting user decisions, §13); draft PR #7 with the decision-independent, LLM-free foundations.
   - Ruling: build only those foundations before approval — the user asked for maximum progress within the session's credit budget — cost if wrong: the draft is discarded.
+- 2026-10-02: the user approved the benchmark design with all recommended options (fold re-distillation, graded relevance, boundary check kept, \$60 stage-1 cap with the pilot first, variants V0/B-comp/B-rand/V1/V2/W-cv). The cost model was clarified: the \$ figures are plan usage via the claude CLI, not a bill. PR #7 now implements stages 1–3 and `cb bench pilot`.
+  - Ruling: the leak guard checks only the Short-derived prompt parts (playbook block, audience titles); the transcript always contains every moment's words — cost if wrong: none (a whole-prompt check would fire on every episode).
+  - Ruling: `--max-usd` is cumulative over all of stage 1, counting already-built pools — a run resumed after a usage limit must not get a fresh budget — cost if wrong: none.
+  - Ruling: pilot default cap \$15 (counted toward the \$60) — cost if wrong: a pilot that needs a higher cap stops early and can be resumed.
 
