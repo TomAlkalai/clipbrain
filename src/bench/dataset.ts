@@ -165,7 +165,7 @@ function cachedEpisodeMeta(): Map<string, { title: string; durationSec: number; 
 }
 
 /** Cached json3 words for an episode (written by fetchSubs during `mine`), or null. */
-function cachedWords(videoId: string): Word[] | null {
+export function cachedWords(videoId: string): Word[] | null {
   const cached = readJsonOr<unknown>(path.join(DATA, 'cache', 'subs', `${videoId}.json`), null);
   return Array.isArray(cached) ? (cached as Word[]) : null;
 }
