@@ -2,7 +2,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import crypto from 'node:crypto';
 import { bundle } from '@remotion/bundler';
-import { renderMedia, selectComposition } from '@remotion/renderer';
+import { makeCancelSignal, openBrowser, renderMedia, selectComposition, type HeadlessBrowser } from '@remotion/renderer';
 import { ROOT, DATA } from '../config.js';
 import { ffmpeg, ffprobe } from '../tools/bins.js';
 import { run, runOk } from '../tools/proc.js';
@@ -10,6 +10,7 @@ import { downloadSection } from '../yt/ytdlp.js';
 import { paths, loadClip, saveClip } from '../store.js';
 import { log } from '../log.js';
 import { startStaticServer } from './static.js';
+import { renderTimeouts, withRenderWatchdog, type RenderTimeouts } from './watchdog.js';
 import type { Clip, Edl, EdlCaption, EdlSegment, Source } from '../types.js';
 
 // The webpack bundle of remotion/index.ts is process-lifetime cacheable — every renderClip()
@@ -53,6 +54,11 @@ export type DownloadHires = (windowStart: number, windowEnd: number, outPath: st
 export type ProbeDurationFn = (file: string) => Promise<number>;
 
 const HIRES_DURATION_TOLERANCE_SEC = 0.6;
+
+// Every ffmpeg/ffprobe step after the Chrome render (loudness passes, measurement, pixel-format
+// probe, poster) gets a kill-on-timeout, so post-processing can't hang a render either. Each
+// step takes seconds on a ~2-minute clip; this is a backstop, not a budget.
+const FFMPEG_STEP_TIMEOUT_MS = 10 * 60_000;
 
 // Windows reports a rename over a file another process still has open as EBUSY or EPERM (and
 // EACCES in some sharing-violation cases — graceful-fs retries the same three). Holders are
@@ -321,7 +327,7 @@ async function loudnormPass(rawMp4: string, outMp4: string, tp: number): Promise
     '-af', `loudnorm=I=${LOUDNESS_I}:TP=${tp}:LRA=${LOUDNESS_LRA}:print_format=json`,
     '-f', 'null',
     nullSink(),
-  ]);
+  ], { timeoutMs: FFMPEG_STEP_TIMEOUT_MS });
   if (pass1.code !== 0) {
     throw new Error(`master: loudnorm analysis pass failed (code ${pass1.code}): ${pass1.stderr.slice(-2000)}`);
   }
@@ -343,7 +349,7 @@ async function loudnormPass(rawMp4: string, outMp4: string, tp: number): Promise
     '-ar', '48000',
     '-movflags', '+faststart',
     outMp4,
-  ]);
+  ], { timeoutMs: FFMPEG_STEP_TIMEOUT_MS });
 }
 
 /**
@@ -364,7 +370,7 @@ export function parseEbur128Summary(stderr: string): { integratedLufs: number; t
 }
 
 async function measureDelivered(file: string): Promise<{ integratedLufs: number; truePeakDbtp: number }> {
-  const r = await run(ffmpeg(), ['-y', '-i', file, '-af', 'ebur128=peak=true', '-f', 'null', nullSink()]);
+  const r = await run(ffmpeg(), ['-y', '-i', file, '-af', 'ebur128=peak=true', '-f', 'null', nullSink()], { timeoutMs: FFMPEG_STEP_TIMEOUT_MS });
   if (r.code !== 0) {
     throw new Error(`master: ebur128 measurement of delivered file failed (code ${r.code}): ${r.stderr.slice(-2000)}`);
   }
@@ -467,11 +473,67 @@ export async function assertDeliverablePixelFormat(file: string): Promise<void> 
     '-show_entries', 'stream=pix_fmt',
     '-of', 'json',
     file,
-  ]);
+  ], { timeoutMs: FFMPEG_STEP_TIMEOUT_MS });
   const j = JSON.parse(r.stdout);
   const pixFmt = j.streams?.[0]?.pix_fmt;
   if (pixFmt !== DELIVERABLE_PIX_FMT) {
     throw new Error(`assertDeliverablePixelFormat: ${file} has pix_fmt="${pixFmt}", expected exactly "${DELIVERABLE_PIX_FMT}"`);
+  }
+}
+
+export type RenderBrowser = Pick<HeadlessBrowser, 'close'>;
+
+/** What renderClip drives, injectable so the watchdog/cleanup paths are testable without Chrome. */
+export type RenderDeps = {
+  getBundleLocation: () => Promise<string>;
+  startStaticServer: typeof startStaticServer;
+  openBrowser: (executable: string | null) => Promise<RenderBrowser>;
+  selectComposition: typeof selectComposition;
+  renderMedia: typeof renderMedia;
+  makeCancelSignal: typeof makeCancelSignal;
+  master: (rawMp4: string, outMp4: string) => Promise<void>;
+  assertDeliverablePixelFormat: (file: string) => Promise<void>;
+  makePoster: (renderMp4: string, posterJpg: string) => Promise<void>;
+  timeouts: () => RenderTimeouts;
+};
+
+async function makePoster(renderMp4: string, posterJpg: string): Promise<void> {
+  await runOk(ffmpeg(), ['-y', '-ss', '1.0', '-i', renderMp4, '-frames:v', '1', '-vf', 'scale=360:-2', posterJpg], {
+    timeoutMs: FFMPEG_STEP_TIMEOUT_MS,
+  });
+}
+
+function defaultRenderDeps(): RenderDeps {
+  return {
+    getBundleLocation,
+    startStaticServer,
+    openBrowser: (executable) => openBrowser('chrome', { browserExecutable: executable }),
+    selectComposition,
+    renderMedia,
+    makeCancelSignal,
+    master,
+    assertDeliverablePixelFormat,
+    makePoster,
+    timeouts: renderTimeouts,
+  };
+}
+
+const TEARDOWN_TIMEOUT_MS = 30_000;
+
+/** Runs a teardown step without letting it throw or hang the caller. */
+async function teardown(what: string, fn: () => Promise<void>): Promise<void> {
+  let timer: NodeJS.Timeout | undefined;
+  try {
+    await Promise.race([
+      fn(),
+      new Promise<void>((_, reject) => {
+        timer = setTimeout(() => reject(new Error(`timed out after ${TEARDOWN_TIMEOUT_MS / 1000}s`)), TEARDOWN_TIMEOUT_MS);
+      }),
+    ]);
+  } catch (err) {
+    log(`warning: ${what} failed: ${err instanceof Error ? err.message : String(err)}`);
+  } finally {
+    clearTimeout(timer);
   }
 }
 
@@ -482,61 +544,111 @@ export async function assertDeliverablePixelFormat(file: string): Promise<void> 
  *   raw.mp4 (Remotion render, h264/aac) → render.mp4 (loudnorm-mastered) → poster.jpg (1s still).
  * Per controller ruling R2, raw.mp4 is kept (not deleted) — QC (Task 13) re-masters from it and
  * deletes it when finished.
+ *
+ * A render can never wait forever (HANDOFF open item #2: a lost Chrome connection once hung a
+ * `produce` run for 5 days). The Chrome phase — launch, composition, frames — runs under
+ * withRenderWatchdog: no Remotion progress for CB_RENDER_STALL_MIN (default 5) minutes, or more
+ * than CB_RENDER_TIMEOUT_MIN (default 60) minutes in total, cancels renderMedia, kills this
+ * render's own Chrome (opened here, so it can be closed here) and throws a RenderTimeoutError.
+ * Chrome and the static server are always torn down, with a bound; the ffmpeg post-steps run
+ * after that, each with a kill-on-timeout. Callers (produce, requalify, QC, the review job
+ * runner) record the error on the clip and move on to the next one.
  */
-export async function renderClip(clipId: string): Promise<void> {
+export async function renderClip(clipId: string, deps: Partial<RenderDeps> = {}): Promise<void> {
+  const d: RenderDeps = { ...defaultRenderDeps(), ...deps };
   const clip = loadClip(clipId);
   if (!clip.edl) throw new Error(`clip ${clipId} has no edl — build one first (buildEdl + saveClip)`);
+  const edlIn = clip.edl;
 
   const dir = paths.clip(clipId);
   fs.mkdirSync(dir, { recursive: true });
+  const rawPath = path.join(dir, 'raw.mp4');
+  const renderPath = path.join(dir, 'render.mp4');
 
-  const bundleLocation = await getBundleLocation();
-  const server = await startStaticServer(DATA);
+  const limits = d.timeouts();
+  for (const w of limits.warnings) log(`warning: ${w}`);
+
+  const bundleLocation = await d.getBundleLocation();
+  const server = await d.startStaticServer(DATA);
+  const { cancelSignal, cancel } = d.makeCancelSignal();
+  let browser: RenderBrowser | null = null;
+  let aborted = false;
+  const closeBrowser = async () => {
+    const b = browser;
+    browser = null;
+    if (b) await b.close({ silent: true });
+  };
+
+  const totalFrames = Math.max(1, Math.round(edlIn.durationSec * edlIn.fps));
+  let stage = 'starting Chrome';
+  let renderedFrames = 0;
+
   try {
-    const edl: Edl = { ...clip.edl, videoSrc: `${server.url}/clips/${clipId}/hires.mp4` };
-    const inputProps = { edl };
-    const chrome = browserExecutable();
-
-    const composition = await selectComposition({
-      serveUrl: bundleLocation,
-      id: 'Clip',
-      inputProps,
-      browserExecutable: chrome,
-    });
-
-    const rawPath = path.join(dir, 'raw.mp4');
-    let lastLoggedPct = -10;
-    await renderMedia({
-      composition,
-      serveUrl: bundleLocation,
-      codec: 'h264',
-      crf: 18,
-      audioCodec: 'aac',
-      pixelFormat: 'yuv420p',
-      colorSpace: 'bt709',
-      outputLocation: rawPath,
-      inputProps,
-      browserExecutable: chrome,
-      onProgress: ({ progress }) => {
-        const pct = Math.floor(progress * 100);
-        if (pct >= lastLoggedPct + 10) {
-          lastLoggedPct = pct - (pct % 10);
-          log(`render ${clipId}: ${lastLoggedPct}%`);
+    await withRenderWatchdog(
+      async ({ progress }) => {
+        const opened = await d.openBrowser(browserExecutable() ?? null);
+        if (aborted) {
+          // The watchdog fired while Chrome was still launching: don't leak the late browser.
+          await opened.close({ silent: true }).catch(() => {});
+          throw new Error('render aborted while Chrome was starting');
         }
+        browser = opened;
+        progress();
+
+        stage = 'loading the composition';
+        const edl: Edl = { ...edlIn, videoSrc: `${server.url}/clips/${clipId}/hires.mp4` };
+        const inputProps = { edl };
+        const puppeteerInstance = opened as HeadlessBrowser;
+        const composition = await d.selectComposition({ serveUrl: bundleLocation, id: 'Clip', inputProps, puppeteerInstance });
+        progress();
+
+        stage = 'rendering frames';
+        let lastLoggedPct = -10;
+        await d.renderMedia({
+          composition,
+          serveUrl: bundleLocation,
+          codec: 'h264',
+          crf: 18,
+          audioCodec: 'aac',
+          pixelFormat: 'yuv420p',
+          colorSpace: 'bt709',
+          outputLocation: rawPath,
+          inputProps,
+          puppeteerInstance,
+          cancelSignal,
+          onProgress: (p) => {
+            progress();
+            renderedFrames = p.renderedFrames;
+            if (p.stitchStage === 'muxing') stage = 'muxing';
+            const pct = Math.floor(p.progress * 100);
+            if (pct >= lastLoggedPct + 10) {
+              lastLoggedPct = pct - (pct % 10);
+              log(`render ${clipId}: ${lastLoggedPct}%`);
+            }
+          },
+        });
       },
-    });
-
-    const renderPath = path.join(dir, 'render.mp4');
-    await master(rawPath, renderPath);
-    await assertDeliverablePixelFormat(renderPath);
-
-    const posterPath = path.join(dir, 'poster.jpg');
-    await runOk(ffmpeg(), ['-y', '-ss', '1.0', '-i', renderPath, '-frames:v', '1', '-vf', 'scale=360:-2', posterPath]);
-
-    clip.renders += 1;
-    clip.status = 'rendered';
-    saveClip(clip);
+      {
+        stallMs: limits.stallMs,
+        hardMs: limits.hardMs,
+        describe: () => `${stage}, frame ${renderedFrames}/${totalFrames}`,
+        cleanup: async () => {
+          aborted = true;
+          cancel();
+          await closeBrowser();
+        },
+      },
+    );
   } finally {
-    await server.close();
+    await teardown(`closing Chrome for ${clipId}`, closeBrowser);
+    await teardown(`closing the static server for ${clipId}`, () => server.close());
   }
+
+  await d.master(rawPath, renderPath);
+  await d.assertDeliverablePixelFormat(renderPath);
+  await d.makePoster(renderPath, path.join(dir, 'poster.jpg'));
+
+  clip.renders += 1;
+  clip.status = 'rendered';
+  saveClip(clip);
 }

@@ -13,6 +13,7 @@ import path from 'node:path';
 process.env.CB_DATA = fs.mkdtempSync(path.join(os.tmpdir(), 'cb-produce-resume-'));
 
 const { produceSource, requalifyClip, requalifySource } = await import('../src/produce.js');
+const { RenderTimeoutError } = await import('../src/render/watchdog.js');
 const { saveCreator, saveSource, saveClip, loadClip, paths, writeJson, listClips } = await import('../src/store.js');
 const { SIGNALS } = await import('../src/types.js');
 import type { Clip, Creator, Source, Candidate, Sentence, Scores, ClipStatus } from '../src/types.js';
@@ -312,4 +313,55 @@ it('requalifySource refuses --status published outright', async () => {
   const { calls, deps } = makeStubs();
   await expect(requalifySource(source.id, 'published', deps)).rejects.toThrow(/published/);
   expect(calls).toEqual([]);
+});
+
+// HANDOFF open item #2: a render that times out must not stop the production run. The timed-out
+// clip keeps its status (planned: a later `produce` retries it) with the timeout as its error, and
+// the next candidate is produced as normal.
+it('produceSource: a render timeout fails only that clip, records why, and continues with the next one', async () => {
+  const source = makeSource();
+  const c1 = candidate(source, 'cand_hang', 1);
+  const c2 = candidate(source, 'cand_next', 2);
+  setSourceFixtures(source, [c1, c2]);
+  saveClip(baseClip(source, { id: 'clip_hang', candidateId: c1.id, status: 'planned' }));
+  saveClip(baseClip(source, { id: 'clip_next', candidateId: c2.id, status: 'planned' }));
+
+  const { calls, deps } = makeStubs();
+  const timeout = new RenderTimeoutError('stall', 'render timed out: no render progress for 5.0 min (last progress: rendering frames, frame 812/3510) — render aborted and its Chrome closed');
+  const results = await produceSource(source.id, {
+    deps: {
+      ...deps,
+      renderClip: async (clipId: string) => {
+        calls.push(`renderClip:${clipId}`);
+        if (clipId === 'clip_hang') throw timeout;
+      },
+    },
+  });
+
+  expect(calls).toEqual(['ensureHires', 'rebuildEdl', 'renderClip:clip_hang', 'ensureHires', 'rebuildEdl', 'renderClip:clip_next', 'qcClip:clip_next']);
+  expect(results.map((c) => c.id)).toEqual(['clip_hang', 'clip_next']);
+  const hung = loadClip('clip_hang');
+  expect(hung.status).toBe('planned');
+  expect(hung.error).toBe(timeout.message);
+  expect(loadClip('clip_next').error).toBeUndefined();
+});
+
+it('requalifySource: a render timeout on one clip does not stop the others', async () => {
+  const source = makeSource();
+  const c1 = candidate(source, 'cand_rq1', 1);
+  const c2 = candidate(source, 'cand_rq2', 2);
+  setSourceFixtures(source, [c1, c2]);
+  saveClip(baseClip(source, { id: 'clip_rq_hang', candidateId: c1.id, status: 'qc_failed' }));
+  saveClip(baseClip(source, { id: 'clip_rq_next', candidateId: c2.id, status: 'qc_failed' }));
+  const { calls, deps } = makeStubs();
+  const results = await requalifySource(source.id, 'qc_failed', {
+    ...deps,
+    renderClip: async (clipId: string) => {
+      calls.push(`renderClip:${clipId}`);
+      if (clipId === 'clip_rq_hang') throw new RenderTimeoutError('hard', 'render timed out: exceeded the 60.0 min render limit');
+    },
+  });
+  expect(results.map((c) => c.id).sort()).toEqual(['clip_rq_hang', 'clip_rq_next']);
+  expect(calls).toContain('qcClip:clip_rq_next');
+  expect(loadClip('clip_rq_hang').error).toMatch(/exceeded the 60.0 min render limit/);
 });
